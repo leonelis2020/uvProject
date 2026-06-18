@@ -471,11 +471,61 @@ def ensure_authenticated() -> dict | None:
     return st.session_state.get(SS_AUTH_USER)
 
 
-def upload_to_storage(bucket: str, path: str, data: bytes) -> str:
-    """Supabase Storage 업로드 후 public URL (또는 signed URL) 반환."""
-    # TODO[PHASE-4]: conn.client.storage.from_(bucket).upload(path, data)
-    # TODO[PHASE-4]: return conn.client.storage.from_(bucket).get_public_url(path)
-    raise NotImplementedError("PHASE 4: Storage 업로드 미구현 (스카폴딩 슬롯)")
+def _resolve_storage():
+    """`st_supabase_connection` 내부의 supabase-py Storage 클라이언트를 안전하게 추출.
+
+    버전에 따라 `conn.client` / `conn._client` / `conn.session` 중 노출 위치가
+    다를 수 있으므로 방어적으로 탐색한다.
+    """
+    for attr in ("client", "_client", "session", "supabase_client"):
+        candidate = getattr(conn, attr, None)
+        storage = getattr(candidate, "storage", None) if candidate is not None else None
+        if storage is not None:
+            return storage
+    # 마지막 시도: conn 자체가 storage 속성을 직접 노출하는 경우
+    storage = getattr(conn, "storage", None)
+    if storage is not None:
+        return storage
+    raise RuntimeError(
+        "Supabase Storage 클라이언트를 찾을 수 없습니다. "
+        "st_supabase_connection 버전을 확인하세요."
+    )
+
+
+def upload_to_storage(
+    bucket: str,
+    path: str,
+    data: bytes,
+    *,
+    content_type: str = "image/png",
+) -> str:
+    """Supabase Storage 업로드 후 public URL 반환.
+
+    경로 스킴: 호출자가 `f"{uuid}/origin.png"` 형태로 unique key 를 만들어 넘긴다.
+    같은 키로 두 번 호출돼도 `upsert=true` 로 덮어쓴다 (수정/재시도 안전).
+
+    Args:
+        bucket: Supabase Storage 버킷 이름 (예: `originals`, `results`).
+        path:   버킷 내부 경로 (UUID 기반 유니크 키).
+        data:   업로드할 바이너리.
+        content_type: MIME — 기본 image/png. JPEG 등으로 호출 가능.
+
+    Returns:
+        public URL 문자열. (private 버킷이라면 호출 측에서 signed URL 로 교체)
+    """
+    storage = _resolve_storage()
+    bucket_api = storage.from_(bucket)
+    # supabase-py v2: upload(path, file=..., file_options={...})
+    try:
+        bucket_api.upload(
+            path=path,
+            file=data,
+            file_options={"content-type": content_type, "upsert": "true"},
+        )
+    except TypeError:
+        # 구버전 supabase-py 호환 — positional 시그니처
+        bucket_api.upload(path, data, {"content-type": content_type, "upsert": "true"})
+    return bucket_api.get_public_url(path)
 
 
 def save_simulation_result(
