@@ -601,12 +601,23 @@ def save_simulation_result(
 def save_snapshot(parent_project_id: str, matrix, origin_url, result_url, base_colors) -> str | None:
     """기존 프로젝트의 수정본을 새 row 로 INSERT (스냅샷).
 
-    [참조 무결성]
-      * 기존 row 를 UPDATE 하지 않고 새 row 를 INSERT 한 뒤 `parent_id` 로 부모를
-        가리킨다. 갤러리/히스토리는 parent_id 그래프를 따라간다.
+    [의도적으로 Phase 2 범위 외]
+      * Phase 2 멀티리전 사양은 **마스크를 DB에 저장하지 않는다**. 따라서 합성
+        결과를 정확히 재현할 수 없어 "원본을 편집해 새 버전을 만든다" 라는
+        스냅샷 의미가 약해진다 (cursor 작업 지시: "재현/편집 안 할 거라 과한
+        정규화는 불필요").
+      * `scrap_project` 가 익명 카운트만 +1 하는 것으로 Phase 2 의 모든
+        '재공유' UX 를 흡수한다. 따라서 본 함수는 현재 호출되지 않는다.
+      * 향후 마스크 직렬화 정책이 결정되면 본 함수를 살려서:
+          - parent_id = parent_project_id 로 새 projects row INSERT
+          - 동일 palettes row 복제 (또는 base_colors 만 새로 저장)
+          - 그래프 형태 히스토리(`parent_id` 셀프 FK) 유지
+        형태로 구현한다.
     """
-    # TODO[PHASE-4]: save_simulation_result 와 유사하나 parent_id 필드 추가
-    raise NotImplementedError("PHASE 4: 스냅샷 INSERT 미구현 (스카폴딩 슬롯)")
+    raise NotImplementedError(
+        "save_snapshot 은 Phase 2 범위 외 — 마스크 미저장 정책상 재현 불가 "
+        "(필요해질 때 활성화)."
+    )
 
 
 # =============================================================================
