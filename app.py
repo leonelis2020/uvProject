@@ -48,6 +48,26 @@ except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
 
 
+# ── Streamlit 버전 호환 헬퍼 ──────────────────────────────────────────────────
+# Streamlit 의 width 관련 API 가 두 번 deprecate 됐다:
+#   * `use_column_width=True`     : ~1.32 이전 표준 → 1.32+ 에서 deprecated
+#   * `use_container_width=True`  : 1.32 표준     → 1.51+ 에서 deprecated
+#   * `width="stretch"|"content"|int` : 1.51+ 신표준
+# 핀이 `>=1.36,<1.56` 이라 두 deprecation 모두에 걸칠 수 있어
+# 런타임 버전 체크로 올바른 kwargs 를 반환한다.
+def _full_width_kwargs() -> dict:
+    try:
+        ver = tuple(int(x) for x in st.__version__.split(".")[:2])
+    except Exception:
+        ver = (0, 0)
+    if ver >= (1, 51):
+        return {"width": "stretch"}
+    return {"use_container_width": True}
+
+
+_FW = _full_width_kwargs()
+
+
 # ── streamlit-drawable-canvas 호환성 정책 ─────────────────────────────────────
 # `streamlit-drawable-canvas == 0.9.3` 는 Streamlit 1.42 직전 기준으로 작성됐고,
 # 그 이후 Streamlit 이 `image_to_url` 의 시그니처(`width: int` → `layout_config`)
@@ -1149,14 +1169,14 @@ def _render_auth_panel() -> None:
             "설정",
             key="settings_btn",
             help="닉네임 변경 / DB 진단",
-            use_container_width=True,
+            **_FW,
         ):
             show_settings_modal()
         if col_b.button(
             "로그아웃",
             key="signout_btn",
             help="현재 세션 종료",
-            use_container_width=True,
+            **_FW,
         ):
             sign_out_user()
             st.rerun()
@@ -1171,7 +1191,7 @@ def _render_auth_panel() -> None:
             in_email = st.text_input("이메일", key="signin_email")
             in_pwd = st.text_input("비밀번호", type="password", key="signin_pwd")
             submitted_in = st.form_submit_button(
-                "로그인", use_container_width=True, type="primary"
+                "로그인", **_FW, type="primary"
             )
         if submitted_in:
             msg = sign_in_user(in_email, in_pwd)
@@ -1189,7 +1209,7 @@ def _render_auth_panel() -> None:
             )
             up_nick = st.text_input("닉네임 (선택)", key="signup_nick")
             submitted_up = st.form_submit_button(
-                "가입", use_container_width=True
+                "가입", **_FW
             )
         if submitted_up:
             msg = sign_up_user(up_email, up_pwd, up_nick)
@@ -1233,7 +1253,7 @@ def _render_lineup(items: list[dict], key_prefix: str) -> None:
                 if st.button(
                     "Palette Title",
                     key=f"{key_prefix}_open_{proj['id']}",
-                    use_container_width=True,
+                    **_FW,
                 ):
                     show_project_modal(proj, mode="view")
 
@@ -1244,7 +1264,7 @@ def render_original_image_panel() -> None:
     with st.container(border=True):
         img = st.session_state.get(SS_ORIGIN_IMAGE)
         if img is not None:
-            st.image(img, use_container_width=True)
+            st.image(img, **_FW)
         else:
             st.markdown(
                 "<div style='height:320px;display:flex;align-items:center;"
@@ -1332,7 +1352,7 @@ def _render_region_panel() -> None:
                 label,
                 key=f"add_region_{subj['id']}",
                 type=("primary" if already_used else "secondary"),
-                use_container_width=True,
+                **_FW,
                 help=("이미 영역으로 추가됨 — 다시 누르면 영역이 하나 더 생성됩니다." if already_used else None),
             ):
                 regions.append({"subject": subj, "mask": None, "matrix": None})
@@ -1424,11 +1444,9 @@ def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None
 
     iw, ih = img_pil.size  # PIL: (W, H)
 
-    st.info(
-        "🖱️ 캔버스 마우스 트래킹이 현재 Streamlit 버전과 비호환이라 "
-        "사각 영역 슬라이더로 대체합니다. 슬라이더로 영역을 지정하면 즉시 "
-        "마스크가 적용됩니다."
-    )
+    # ※ "캔버스 비호환이라 슬라이더로 대체" 안내 배너는 매 rerun 마다 노출되어
+    # 영역 expander 안에서 시각적 노이즈가 되므로 제거. 슬라이더 4개 자체가
+    # 충분히 자명한 UI 이며, 필요 시 설정 모달 진단 패널에서 추가 안내를 본다.
 
     bcols = st.columns(2)
     with bcols[0]:
@@ -1470,7 +1488,7 @@ def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None
     arr[py1:py2, px1:px1 + border_w] = overlay_color
     arr[py1:py2, px2 - border_w:px2] = overlay_color
 
-    st.image(Image.fromarray(arr), use_container_width=True)
+    st.image(Image.fromarray(arr), **_FW)
     st.caption(
         f"마스크 영역: {(x2 - x1)}% × {(y2 - y1)}%  "
         f"({px2 - px1} × {py2 - py1} px = {int(mask.sum())} 픽셀)"
@@ -1494,7 +1512,7 @@ def _render_illuminant_tag_grid() -> None:
                 illu["name"],
                 key=f"illu_{illu['id']}",
                 type=("primary" if is_sel else "secondary"),
-                use_container_width=True,
+                **_FW,
                 help=illu.get("description") or "",
             ):
                 if is_sel:
@@ -1509,7 +1527,7 @@ def render_converted_image_panel() -> None:
     with st.container(border=True):
         result = st.session_state.get(SS_RESULT_BYTES)
         if result:
-            st.image(result, use_container_width=True)
+            st.image(result, **_FW)
         else:
             st.markdown(
                 "<div style='height:240px;display:flex;align-items:center;"
@@ -1586,7 +1604,7 @@ def render_action_buttons() -> None:
     if st.button(
         "Convert",
         type="primary",
-        use_container_width=True,
+        **_FW,
         disabled=convert_disabled,
         help=convert_help,
     ):
@@ -1598,7 +1616,7 @@ def render_action_buttons() -> None:
     finish_disabled = not st.session_state.get(SS_BASE_COLORS)
     if st.button(
         "Finish",
-        use_container_width=True,
+        **_FW,
         disabled=finish_disabled,
         help=("Convert 를 먼저 실행하세요." if finish_disabled else None),
     ):
@@ -1743,13 +1761,13 @@ def show_settings_modal() -> None:
     )
 
     btn_cols = st.columns([1, 1])
-    if btn_cols[0].button("취소", key="settings_cancel", use_container_width=True):
+    if btn_cols[0].button("취소", key="settings_cancel", **_FW):
         st.rerun()
     if btn_cols[1].button(
         "저장",
         key="settings_save",
         type="primary",
-        use_container_width=True,
+        **_FW,
         disabled=(new_nick.strip() == current_nick.strip()),
     ):
         msg = update_user_nickname(user["id"], new_nick)
@@ -1815,9 +1833,9 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
     with left:
         st.markdown("**원본 이미지**")
         if is_share and project.get("_origin_bytes"):
-            st.image(project["_origin_bytes"], use_container_width=True)
+            st.image(project["_origin_bytes"], **_FW)
         elif project.get("origin_path"):
-            st.image(project["origin_path"], use_container_width=True)
+            st.image(project["origin_path"], **_FW)
         else:
             st.caption("(원본 이미지 없음)")
 
@@ -1888,12 +1906,12 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
         )
 
         btn_cols = st.columns([1, 1])
-        if btn_cols[0].button("취소", use_container_width=True, key="modal_cancel"):
+        if btn_cols[0].button("취소", **_FW, key="modal_cancel"):
             st.rerun()
         if btn_cols[1].button(
             "✅ 공유 확정",
             type="primary",
-            use_container_width=True,
+            **_FW,
             key="modal_confirm_share",
         ):
             st.session_state[SS_IS_ANON] = anon
