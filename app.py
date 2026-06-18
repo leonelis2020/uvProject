@@ -47,6 +47,42 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
 
+
+# ── 호환성 shim: streamlit.elements.image.image_to_url ────────────────────────
+# `streamlit-drawable-canvas == 0.9.3` 은 Streamlit 내부의
+# `streamlit.elements.image.image_to_url` 에 의존한다. Streamlit 1.42 부근에서
+# 해당 함수가 다른 모듈로 옮겨졌기 때문에 신버전에서는 캔버스 호출 시
+# `AttributeError: module 'streamlit.elements.image' has no attribute 'image_to_url'`
+# 가 발생한다. 모듈 로드 시점에 신/구 경로를 모두 시도하여 가능하면 복구한다.
+# 실패해도 예외를 던지지 않으며, `_render_mask_canvas_for_region` 가 사각 영역
+# 슬라이더 폴백으로 자연스럽게 전환한다.
+def _patch_streamlit_image_to_url() -> bool:
+    try:
+        import streamlit.elements.image as _img_mod
+    except Exception:
+        return False
+    if hasattr(_img_mod, "image_to_url"):
+        return True
+    for module_path in (
+        "streamlit.elements.lib.image_utils",
+        "streamlit.elements.image_utils",
+    ):
+        try:
+            mod = __import__(module_path, fromlist=["image_to_url"])
+        except Exception:
+            continue
+        fn = getattr(mod, "image_to_url", None)
+        if fn is not None:
+            try:
+                _img_mod.image_to_url = fn  # type: ignore[attr-defined]
+                return True
+            except Exception:
+                continue
+    return False
+
+
+_STREAMLIT_CANVAS_COMPAT_OK = _patch_streamlit_image_to_url()
+
 # =============================================================================
 # PHASE 0: CONNECTION & MASTER LAYER
 #   - 시스템 환경 변수 → secrets.toml 백업 순으로 자격 증명 로드 (기존 로직 보호)
@@ -969,16 +1005,16 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
         )
     except AttributeError as exc:
         if "image_to_url" in str(exc) or "streamlit.elements.image" in str(exc):
-            st.error(
-                "현재 설치된 Streamlit 버전이 `streamlit-drawable-canvas`와 호환되지 않습니다.\n"
-                "requirements.txt에 따라 Streamlit을 1.55.x 이하로 설치한 뒤 다시 실행하세요."
-            )
+            # Streamlit 신버전 비호환 — bbox 슬라이더 폴백.
+            _render_bbox_mask_fallback(region_index, region, img_pil)
             return
         raise
     except Exception as exc:
-        st.error(
-            f"`streamlit-drawable-canvas` 실행 중 오류가 발생했습니다: {exc}"
+        st.warning(
+            f"`streamlit-drawable-canvas` 실행 중 오류가 발생했습니다: {exc}\n"
+            "사각 영역 슬라이더로 대체합니다."
         )
+        _render_bbox_mask_fallback(region_index, region, img_pil)
         return
 
     # canvas 알파 채널을 이진화 → 실제 이미지 좌표계로 INTER_NEAREST 리사이즈
@@ -992,6 +1028,75 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
     raw_mask = (raw_alpha > 0).astype(np.uint8)
     mask_native = cv2.resize(raw_mask, (iw, ih), interpolation=cv2.INTER_NEAREST)
     region["mask"] = mask_native.astype(bool)
+
+
+def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None:
+    """캔버스 마우스 트래킹이 동작하지 않을 때의 사각 영역 마스크 UI.
+
+    4개 슬라이더 (left / right / top / bottom %) 로 사각 영역을 지정하고,
+    해당 boolean 마스크를 `region['mask']` 에 저장한다. 시각 피드백을 위해
+    오렌지 오버레이 + 테두리가 그려진 미리보기를 함께 노출한다.
+
+    freedraw 가 아니라 사각형뿐인 점은 명확한 제약이며, 사용자가 보기에
+    "왜 안 칠해지나" 가 아니라 "이 영역에 매핑한다" 로 흐름이 보존된다.
+    """
+    if Image is None or np is None:
+        st.warning("Pillow / numpy 가 필요합니다 (requirements 설치).")
+        return
+
+    iw, ih = img_pil.size  # PIL: (W, H)
+
+    st.info(
+        "🖱️ 캔버스 마우스 트래킹이 현재 Streamlit 버전과 비호환이라 "
+        "사각 영역 슬라이더로 대체합니다. 슬라이더로 영역을 지정하면 즉시 "
+        "마스크가 적용됩니다."
+    )
+
+    bcols = st.columns(2)
+    with bcols[0]:
+        x1 = st.slider(
+            "좌측 (%)", 0, 99, 10, key=f"bbox_x1_{region_index}"
+        )
+        y1 = st.slider(
+            "상단 (%)", 0, 99, 10, key=f"bbox_y1_{region_index}"
+        )
+    with bcols[1]:
+        x2 = st.slider(
+            "우측 (%)", 1, 100, 90, key=f"bbox_x2_{region_index}"
+        )
+        y2 = st.slider(
+            "하단 (%)", 1, 100, 90, key=f"bbox_y2_{region_index}"
+        )
+
+    if x1 >= x2 or y1 >= y2:
+        st.warning("범위가 올바르지 않습니다 (좌측 < 우측, 상단 < 하단).")
+        region["mask"] = None
+        return
+
+    px1, px2 = int(iw * x1 / 100), int(iw * x2 / 100)
+    py1, py2 = int(ih * y1 / 100), int(ih * y2 / 100)
+
+    mask = np.zeros((ih, iw), dtype=bool)
+    mask[py1:py2, px1:px2] = True
+    region["mask"] = mask
+
+    # 시각 피드백 — 반투명 오버레이 + 테두리
+    arr = np.asarray(img_pil.convert("RGB")).copy()
+    overlay_color = np.array([255, 165, 0], dtype=np.float32)
+    region_slice = arr[py1:py2, px1:px2].astype(np.float32)
+    blended = np.clip(region_slice * 0.55 + overlay_color * 0.45, 0, 255).astype(np.uint8)
+    arr[py1:py2, px1:px2] = blended
+    border_w = max(2, int(min(iw, ih) * 0.004))
+    arr[py1:py1 + border_w, px1:px2] = overlay_color
+    arr[py2 - border_w:py2, px1:px2] = overlay_color
+    arr[py1:py2, px1:px1 + border_w] = overlay_color
+    arr[py1:py2, px2 - border_w:px2] = overlay_color
+
+    st.image(Image.fromarray(arr), use_container_width=True)
+    st.caption(
+        f"마스크 영역: {(x2 - x1)}% × {(y2 - y1)}%  "
+        f"({px2 - px1} × {py2 - py1} px = {int(mask.sum())} 픽셀)"
+    )
 
 
 def _render_illuminant_tag_grid() -> None:
