@@ -48,6 +48,26 @@ except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
 
 
+# ── Streamlit 버전 호환 헬퍼 ──────────────────────────────────────────────────
+# Streamlit 의 width 관련 API 가 두 번 deprecate 됐다:
+#   * `use_column_width=True`     : ~1.32 이전 표준 → 1.32+ 에서 deprecated
+#   * `use_container_width=True`  : 1.32 표준     → 1.51+ 에서 deprecated
+#   * `width="stretch"|"content"|int` : 1.51+ 신표준
+# 핀이 `>=1.36,<1.56` 이라 두 deprecation 모두에 걸칠 수 있어
+# 런타임 버전 체크로 올바른 kwargs 를 반환한다.
+def _full_width_kwargs() -> dict:
+    try:
+        ver = tuple(int(x) for x in st.__version__.split(".")[:2])
+    except Exception:
+        ver = (0, 0)
+    if ver >= (1, 51):
+        return {"width": "stretch"}
+    return {"use_container_width": True}
+
+
+_FW = _full_width_kwargs()
+
+
 # ── streamlit-drawable-canvas 호환성 정책 ─────────────────────────────────────
 # `streamlit-drawable-canvas == 0.9.3` 는 Streamlit 1.42 직전 기준으로 작성됐고,
 # 그 이후 Streamlit 이 `image_to_url` 의 시그니처(`width: int` → `layout_config`)
@@ -93,8 +113,8 @@ def _get_openai_key() -> str | None:
     1순위: 환경 변수 `OPENAI_API_KEY` (배포 환경 / Codespaces 시크릿)
     2순위: `.streamlit/secrets.toml` 의 `[openai] api_key = "..."`
 
-    프로세스가 시작될 때마다 조회되지 않고 매 호출마다 갱신을 허용한다
-    (Streamlit hot-reload 시 secrets 가 갱신될 수 있음).
+    `_openai_key_info()` 는 같은 우선순위를 따르되 어디서 키가 왔는지
+    + 키의 접두/접미만 추출해 진단용으로 반환한다.
     """
     key = os.environ.get("OPENAI_API_KEY")
     if key:
@@ -103,6 +123,28 @@ def _get_openai_key() -> str | None:
         return st.secrets["openai"]["api_key"]  # type: ignore[index]
     except Exception:
         return None
+
+
+def _openai_key_info() -> dict:
+    """진단용 — 키의 출처(env/secrets/없음) + 길이 + 마스킹된 미리보기."""
+    src = None
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        src = "env"
+    else:
+        try:
+            key = st.secrets["openai"]["api_key"]  # type: ignore[index]
+            src = "secrets"
+        except Exception:
+            key = None
+    if not key:
+        return {"source": None, "length": 0, "preview": None}
+    preview = f"{key[:6]}…{key[-4:]}" if len(key) > 10 else "***"
+    return {"source": src, "length": len(key), "preview": preview}
+
+
+# 마지막 OpenAI 호출 진단 — 설정 모달의 'AI 진단' 섹션이 표시
+SS_OPENAI_LAST_DIAG = "openai_last_diag"
 
 
 # -----------------------------------------------------------------------------
@@ -276,6 +318,14 @@ _MATRIX_SYSTEM_PROMPT = (
 )
 
 
+def _record_openai_diag(**kv) -> None:
+    """OpenAI 호출 직후 진단 상태를 session_state 에 적재. 설정 모달이 표시."""
+    diag = st.session_state.get(SS_OPENAI_LAST_DIAG) or {}
+    diag.update(kv)
+    diag["ts"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    st.session_state[SS_OPENAI_LAST_DIAG] = diag
+
+
 def call_gpt4o_mini_for_matrix(
     rag_context: dict,
     *,
@@ -289,28 +339,55 @@ def call_gpt4o_mini_for_matrix(
       2. RAG context 를 `_MATRIX_SYSTEM_PROMPT` + JSON 사용자 메시지로 합성.
       3. `response_format={"type":"json_object"}` 로 강제 JSON 응답.
       4. `validate_matrix_payload()` 통과 시 즉시 반환.
-      5. 실패 시 최대 `max_retries` 회 재시도 (temperature 동일).
+      5. 실패 시 최대 `max_retries` 회 재시도.
       6. 끝까지 실패하면 IDENTITY 를 반환 (예외를 던지지 않음 →
          `_run_convert_multi` 의 부분 실패 격리 정책과 일관).
+
+    [진단성]
+      모든 분기에서 `_record_openai_diag(...)` 로 마지막 호출의 상태를 저장한다.
+      "API 키 넣었는데 OpenAI 대시보드에 호출이 안 잡힘" 같은 시연 보고를
+      빠르게 식별할 수 있도록 설정 모달의 AI 진단 패널에 노출된다.
     """
     api_key = _get_openai_key()
     if not api_key:
-        # 환경/시크릿 모두 비어 있으면 IDENTITY 로 graceful degrade.
-        # (시연용 RLS 정책과 동일한 톤 — 키 없이도 앱이 꺾이지 않게)
+        _record_openai_diag(
+            stage="no_api_key",
+            ok=False,
+            detail=(
+                "OPENAI_API_KEY 환경변수도 없고 .streamlit/secrets.toml 의 "
+                "[openai] api_key 도 없습니다."
+            ),
+        )
         return dict(IDENTITY)
 
     try:
         from openai import OpenAI
-    except Exception:
+    except Exception as e:
+        _record_openai_diag(
+            stage="openai_import_failed",
+            ok=False,
+            detail=f"openai 패키지 import 실패: {type(e).__name__}: {e}",
+        )
         return dict(IDENTITY)
 
-    client = OpenAI(api_key=api_key)
+    try:
+        client = OpenAI(api_key=api_key)
+    except Exception as e:
+        _record_openai_diag(
+            stage="client_init_failed",
+            ok=False,
+            detail=f"OpenAI 클라이언트 초기화 실패: {type(e).__name__}: {e}",
+        )
+        return dict(IDENTITY)
+
     user_payload = {
         "subject": rag_context.get("subject"),
         "illuminant": rag_context.get("illuminant"),
     }
 
-    for _attempt in range(max_retries + 1):
+    last_err: str | None = None
+    last_raw: str | None = None
+    for attempt in range(max_retries + 1):
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -325,18 +402,40 @@ def call_gpt4o_mini_for_matrix(
                 ],
             )
             content = (resp.choices[0].message.content or "").strip()
+            last_raw = content[:200]
             if not content:
+                last_err = "empty response content"
                 continue
             payload = json.loads(content)
             if validate_matrix_payload(payload):
+                _record_openai_diag(
+                    stage="ok",
+                    ok=True,
+                    detail=(
+                        f"매트릭스 수신 OK (시도 {attempt + 1}/{max_retries + 1})"
+                    ),
+                    raw_preview=last_raw,
+                    model="gpt-4o-mini",
+                )
                 return payload
-        except json.JSONDecodeError:
+            last_err = "schema validation failed"
+        except json.JSONDecodeError as e:
+            last_err = f"json decode: {e}"
             continue
-        except Exception:
-            # 네트워크 / 레이트리밋 / 인증 등 — 다음 시도 또는 fallback
+        except Exception as e:
+            # 네트워크 / 레이트리밋 / 인증 등 — 예외 타입까지 보존
+            last_err = f"{type(e).__name__}: {e}"
             continue
 
-    # 모든 시도 실패 → IDENTITY (멀티리전 합성에서 그 영역만 변환 없이 진행)
+    _record_openai_diag(
+        stage="failed",
+        ok=False,
+        detail=(
+            f"모든 시도 실패 (총 {max_retries + 1}회). 마지막 에러: {last_err}"
+        ),
+        raw_preview=last_raw,
+        model="gpt-4o-mini",
+    )
     return dict(IDENTITY)
 
 
@@ -519,22 +618,47 @@ def _supabase_url_suffix(n: int = 18) -> str:
         return "?"
 
 
+_PROFILES_RLS_SQL = (
+    "ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY \"profiles_insert_all\" ON public.profiles "
+    "FOR INSERT WITH CHECK (true);\n"
+    "CREATE POLICY \"profiles_update_all\" ON public.profiles "
+    "FOR UPDATE USING (true);\n"
+    "CREATE POLICY \"profiles_select_all\" ON public.profiles "
+    "FOR SELECT USING (true);"
+)
+
+
+def _is_rls_error(err: Exception | str) -> bool:
+    """Postgres 42501 (insufficient_privilege) / RLS 위반 메시지인지 판별."""
+    s = str(err)
+    return (
+        "42501" in s
+        or "row-level security" in s.lower()
+        or "violates row-level security policy" in s.lower()
+    )
+
+
+def _rls_guidance(table: str) -> str:
+    """RLS 차단 시 사용자에게 어디에 무슨 SQL 을 붙여넣을지 안내."""
+    return (
+        f"🔒 Postgres RLS 가 `public.{table}` 의 쓰기를 막고 있습니다.\n"
+        f"Supabase Dashboard → SQL Editor 에 아래를 붙여넣고 실행해 주세요"
+        f"(기존 projects/palettes 와 같은 'open for testing' 정책):\n\n"
+        f"```sql\n{_PROFILES_RLS_SQL}\n```"
+    )
+
+
 def sign_up_user(email: str, password: str, nickname: str) -> str:
     """이메일 + 비밀번호 회원가입 후 `profiles` 행 생성.
 
-    [규칙]
-      * `auth.sign_up()` → 새 `auth.users` row 생성 (이메일 확인 정책은 Supabase
-        프로젝트 설정에 따름; 확인 필요 시 메일함 안내 메시지를 반환).
-      * 성공 시 `profiles(id, nickname)` 을 UPSERT. 트리거로 자동 생성되는
-        프로젝트라도 nickname 만 덮어쓰므로 충돌이 없다.
-
-    [진단 메시지]
-      * 사용자가 시연 중 "회원가입 했는데 DB 에 안 보인다" 라고 자주 헷갈리는
-        지점이 두 가지:
-          (i) `auth.users` 가 아니라 `public.profiles` 만 보고 있음
-          (ii) 다른 Supabase 프로젝트에 가입되고 있음 (URL/Key 불일치)
-        둘 다 진단할 수 있도록 성공 메시지에 `user_id` + URL suffix + 어디서
-        확인하라는 안내를 함께 포함한다.
+    [핵심 동작]
+      * `auth.sign_up()` → `auth.users` row 생성/조회. supabase-py v2 는 이미
+        존재하는 이메일에 대해 **예외를 던지지 않는다** — 응답은 받지만
+        `res.session = None` 이고 종종 `user_obj.identities == []` 가 된다.
+        이 두 시그널로 'duplicate' vs 'fresh signup' 을 구분한다.
+      * 새 가입이면 `profiles(id, nickname)` 을 UPSERT (RLS 차단 시
+        명시적 SQL 안내 반환).
     """
     if not email or not password:
         return "❌ 이메일과 비밀번호를 입력하세요."
@@ -559,13 +683,30 @@ def sign_up_user(email: str, password: str, nickname: str) -> str:
 
     user_obj = getattr(res, "user", None)
     user_id = getattr(user_obj, "id", None) if user_obj else None
+    session = getattr(res, "session", None)
+    identities = getattr(user_obj, "identities", None) if user_obj else None
+
+    # ──────────────────────────────────────────────────────────────
+    # supabase-py v2 의 "duplicate email" 시그널:
+    #   session=None  AND  (identities 비었거나 user_obj 만 채워짐)
+    # 이메일 확인이 켜진 프로젝트에서 '새 가입' 도 session=None 이지만
+    # identities 는 비어 있지 않다.
+    # ──────────────────────────────────────────────────────────────
+    if user_id and session is None and (identities == [] or identities is None):
+        return (
+            "⚠️ 이미 가입된 이메일입니다. 로그인 탭으로 진행하세요.\n"
+            f"- 프로젝트: …{url_suffix}\n"
+            "- 비밀번호를 잊었다면 Supabase Dashboard → Authentication → Users "
+            "에서 비밀번호 재설정 메일을 발송하거나 사용자를 삭제 후 재가입하세요."
+        )
+
     if not user_id:
         # 응답은 받았으나 user.id 가 비어 있는 경우 — 진단 메타데이터로 안내
         bits = []
         if hasattr(res, "session"):
-            bits.append(f"session={bool(getattr(res, 'session', None))}")
+            bits.append(f"session={bool(session)}")
         if hasattr(res, "user"):
-            bits.append(f"user={bool(getattr(res, 'user', None))}")
+            bits.append(f"user={bool(user_obj)}")
         return (
             f"⚠️ 가입 응답에 user.id 가 없습니다 ({', '.join(bits) or 'no diag'}).\n"
             f"- 프로젝트: …{url_suffix}\n"
@@ -575,25 +716,32 @@ def sign_up_user(email: str, password: str, nickname: str) -> str:
 
     chosen_nick = (nickname or "").strip() or email.split("@")[0]
     profile_err: str | None = None
+    profile_rls_blocked = False
     try:
         conn.table("profiles").upsert(
             {"id": user_id, "nickname": chosen_nick}
         ).execute()
     except Exception as e:
         profile_err = f"{type(e).__name__}: {e}"
+        profile_rls_blocked = _is_rls_error(e)
 
     msg = (
-        f"✅ 회원가입 성공!\n"
+        f"✅ auth.users 가입 완료!\n"
         f"- user_id: `{user_id[:8]}…{user_id[-4:]}` (전체는 Supabase 에서 확인)\n"
         f"- 프로젝트: …{url_suffix}\n"
-        f"- 확인 경로: **Supabase Dashboard → Authentication → Users** "
-        f"(public.profiles 는 닉네임만; auth.users 가 마스터)"
+        f"- 확인 경로: **Supabase Dashboard → Authentication → Users**\n"
+        f"  (`public.profiles` 는 닉네임만; `auth.users` 가 마스터)"
     )
-    if profile_err:
+    if profile_rls_blocked:
+        msg += "\n\n" + _rls_guidance("profiles")
         msg += (
-            f"\n⚠️ profiles 행 생성은 실패했지만 auth.users 가입은 완료됨\n"
-            f"- {profile_err}\n"
-            f"- 트리거로 자동 생성되는 환경이면 무시 가능."
+            "\n\n(닉네임은 SQL 적용 후 '설정' 모달에서 다시 저장하면 됩니다. "
+            "auth 가입 자체는 이미 완료됨.)"
+        )
+    elif profile_err:
+        msg += (
+            f"\n\n⚠️ profiles 행 생성 실패 (auth 가입은 성공):\n- {profile_err}\n"
+            "- 트리거로 자동 생성되는 환경이면 무시 가능."
         )
     return msg
 
@@ -651,12 +799,19 @@ def update_user_nickname(user_id: str, new_nickname: str) -> str:
 
     Caller (`show_settings_modal`) 가 성공 시 `SS_AUTH_USER.nickname` 도
     같이 갱신해서 사이드바가 즉시 새 닉네임으로 보이게 한다.
+
+    [에러 처리]
+      * Postgres 42501 (RLS) → `_rls_guidance("profiles")` 로 사용자가 붙여넣을
+        SQL 을 그대로 메시지에 첨부. 시연 중 막혀 있던 가장 흔한 케이스.
+      * UPDATE 가 0건이면 UPSERT 로 폴백 (트리거가 없어 profiles 행이 아직
+        없는 사용자도 닉네임을 설정할 수 있게).
     """
     cleaned = (new_nickname or "").strip()
     if not cleaned:
         return "❌ 닉네임은 비어 있을 수 없습니다."
     if len(cleaned) > 50:
         return "❌ 닉네임은 50자 이내로 입력하세요."
+
     try:
         resp = (
             conn.table("profiles")
@@ -665,7 +820,9 @@ def update_user_nickname(user_id: str, new_nickname: str) -> str:
             .execute()
         )
     except Exception as e:
-        return f"❌ 닉네임 변경 실패: {e}"
+        if _is_rls_error(e):
+            return "❌ 닉네임 변경 실패 (RLS 차단)\n\n" + _rls_guidance("profiles")
+        return f"❌ 닉네임 변경 실패: {type(e).__name__}: {e}"
 
     # 일부 환경에서는 profiles 행이 아직 없어 UPDATE 가 0건일 수 있음 — UPSERT 폴백
     if not getattr(resp, "data", None):
@@ -674,7 +831,12 @@ def update_user_nickname(user_id: str, new_nickname: str) -> str:
                 {"id": user_id, "nickname": cleaned}
             ).execute()
         except Exception as e:
-            return f"❌ profiles 행이 없어 UPSERT 도 실패: {e}"
+            if _is_rls_error(e):
+                return (
+                    "❌ profiles 행이 없고 UPSERT 도 RLS 가 막았습니다.\n\n"
+                    + _rls_guidance("profiles")
+                )
+            return f"❌ profiles 행이 없어 UPSERT 도 실패: {type(e).__name__}: {e}"
 
     return f"✅ 닉네임이 '{cleaned}' 으로 변경되었습니다."
 
@@ -988,31 +1150,36 @@ def render_sidebar() -> None:
 
 
 def _render_auth_panel() -> None:
-    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + ⚙️ + ⎋ (인증)."""
+    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + 설정 + 로그아웃 (인증).
+
+    아이콘(⚙️ / ⎋) 만 사용했을 때 일부 환경의 emoji 폰트가 fallback 정사각형으로
+    렌더되어 가독성이 떨어졌다. 텍스트 라벨 + 단순 ASCII 마커를 함께 사용해
+    OS/브라우저 무관하게 안정적으로 보이게 한다.
+    """
     user = ensure_authenticated()
     if user:
-        col_a, col_b, col_c = st.columns([4, 1, 1])
-        with col_a:
-            st.markdown(f"**{user.get('nickname') or user.get('email') or 'user'}**")
-            uid_short = (user.get("id") or "")[:8]
-            st.caption(f"@{uid_short or 'user_UID'}")
-        with col_b:
-            if st.button(
-                "⚙️",
-                key="settings_btn",
-                help="설정 (닉네임 변경)",
-                use_container_width=True,
-            ):
-                show_settings_modal()
-        with col_c:
-            if st.button(
-                "⎋",
-                key="signout_btn",
-                help="로그아웃",
-                use_container_width=True,
-            ):
-                sign_out_user()
-                st.rerun()
+        # 1행: 닉네임 + UID
+        st.markdown(f"**{user.get('nickname') or user.get('email') or 'user'}**")
+        uid_short = (user.get("id") or "")[:8]
+        st.caption(f"@{uid_short or 'user_UID'}")
+
+        # 2행: 두 개의 동일 너비 텍스트 버튼 — 어떤 환경에서도 깔끔하게 보임
+        col_a, col_b = st.columns(2)
+        if col_a.button(
+            "설정",
+            key="settings_btn",
+            help="닉네임 변경 / DB 진단",
+            **_FW,
+        ):
+            show_settings_modal()
+        if col_b.button(
+            "로그아웃",
+            key="signout_btn",
+            help="현재 세션 종료",
+            **_FW,
+        ):
+            sign_out_user()
+            st.rerun()
         return
 
     # ── 비로그인 상태 — 인라인 폼 ──────────────────────────────────────────
@@ -1024,7 +1191,7 @@ def _render_auth_panel() -> None:
             in_email = st.text_input("이메일", key="signin_email")
             in_pwd = st.text_input("비밀번호", type="password", key="signin_pwd")
             submitted_in = st.form_submit_button(
-                "로그인", use_container_width=True, type="primary"
+                "로그인", **_FW, type="primary"
             )
         if submitted_in:
             msg = sign_in_user(in_email, in_pwd)
@@ -1042,7 +1209,7 @@ def _render_auth_panel() -> None:
             )
             up_nick = st.text_input("닉네임 (선택)", key="signup_nick")
             submitted_up = st.form_submit_button(
-                "가입", use_container_width=True
+                "가입", **_FW
             )
         if submitted_up:
             msg = sign_up_user(up_email, up_pwd, up_nick)
@@ -1086,7 +1253,7 @@ def _render_lineup(items: list[dict], key_prefix: str) -> None:
                 if st.button(
                     "Palette Title",
                     key=f"{key_prefix}_open_{proj['id']}",
-                    use_container_width=True,
+                    **_FW,
                 ):
                     show_project_modal(proj, mode="view")
 
@@ -1097,7 +1264,7 @@ def render_original_image_panel() -> None:
     with st.container(border=True):
         img = st.session_state.get(SS_ORIGIN_IMAGE)
         if img is not None:
-            st.image(img, use_container_width=True)
+            st.image(img, **_FW)
         else:
             st.markdown(
                 "<div style='height:320px;display:flex;align-items:center;"
@@ -1185,7 +1352,7 @@ def _render_region_panel() -> None:
                 label,
                 key=f"add_region_{subj['id']}",
                 type=("primary" if already_used else "secondary"),
-                use_container_width=True,
+                **_FW,
                 help=("이미 영역으로 추가됨 — 다시 누르면 영역이 하나 더 생성됩니다." if already_used else None),
             ):
                 regions.append({"subject": subj, "mask": None, "matrix": None})
@@ -1277,11 +1444,9 @@ def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None
 
     iw, ih = img_pil.size  # PIL: (W, H)
 
-    st.info(
-        "🖱️ 캔버스 마우스 트래킹이 현재 Streamlit 버전과 비호환이라 "
-        "사각 영역 슬라이더로 대체합니다. 슬라이더로 영역을 지정하면 즉시 "
-        "마스크가 적용됩니다."
-    )
+    # ※ "캔버스 비호환이라 슬라이더로 대체" 안내 배너는 매 rerun 마다 노출되어
+    # 영역 expander 안에서 시각적 노이즈가 되므로 제거. 슬라이더 4개 자체가
+    # 충분히 자명한 UI 이며, 필요 시 설정 모달 진단 패널에서 추가 안내를 본다.
 
     bcols = st.columns(2)
     with bcols[0]:
@@ -1323,7 +1488,7 @@ def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None
     arr[py1:py2, px1:px1 + border_w] = overlay_color
     arr[py1:py2, px2 - border_w:px2] = overlay_color
 
-    st.image(Image.fromarray(arr), use_container_width=True)
+    st.image(Image.fromarray(arr), **_FW)
     st.caption(
         f"마스크 영역: {(x2 - x1)}% × {(y2 - y1)}%  "
         f"({px2 - px1} × {py2 - py1} px = {int(mask.sum())} 픽셀)"
@@ -1347,7 +1512,7 @@ def _render_illuminant_tag_grid() -> None:
                 illu["name"],
                 key=f"illu_{illu['id']}",
                 type=("primary" if is_sel else "secondary"),
-                use_container_width=True,
+                **_FW,
                 help=illu.get("description") or "",
             ):
                 if is_sel:
@@ -1362,7 +1527,7 @@ def render_converted_image_panel() -> None:
     with st.container(border=True):
         result = st.session_state.get(SS_RESULT_BYTES)
         if result:
-            st.image(result, use_container_width=True)
+            st.image(result, **_FW)
         else:
             st.markdown(
                 "<div style='height:240px;display:flex;align-items:center;"
@@ -1439,7 +1604,7 @@ def render_action_buttons() -> None:
     if st.button(
         "Convert",
         type="primary",
-        use_container_width=True,
+        **_FW,
         disabled=convert_disabled,
         help=convert_help,
     ):
@@ -1451,7 +1616,7 @@ def render_action_buttons() -> None:
     finish_disabled = not st.session_state.get(SS_BASE_COLORS)
     if st.button(
         "Finish",
-        use_container_width=True,
+        **_FW,
         disabled=finish_disabled,
         help=("Convert 를 먼저 실행하세요." if finish_disabled else None),
     ):
@@ -1596,13 +1761,13 @@ def show_settings_modal() -> None:
     )
 
     btn_cols = st.columns([1, 1])
-    if btn_cols[0].button("취소", key="settings_cancel", use_container_width=True):
+    if btn_cols[0].button("취소", key="settings_cancel", **_FW):
         st.rerun()
     if btn_cols[1].button(
         "저장",
         key="settings_save",
         type="primary",
-        use_container_width=True,
+        **_FW,
         disabled=(new_nick.strip() == current_nick.strip()),
     ):
         msg = update_user_nickname(user["id"], new_nick)
@@ -1616,6 +1781,41 @@ def show_settings_modal() -> None:
             st.rerun()
         else:
             st.error(msg)
+
+    # ── 진단 패널 ─────────────────────────────────────────────────────────
+    st.divider()
+    with st.expander("🔧 연결 / AI 진단", expanded=False):
+        st.markdown("**Supabase**")
+        st.text(f"URL: {s_url or '(미설정)'}")
+        st.text(f"user_id (full): {user.get('id') or '(없음)'}")
+        st.caption(
+            "Supabase Dashboard 의 URL 과 비교하세요. "
+            "다르면 다른 프로젝트에 가입/저장되고 있는 것입니다."
+        )
+
+        st.markdown("**OpenAI API 키**")
+        ki = _openai_key_info()
+        if not ki["source"]:
+            st.error(
+                "키가 로드되지 않았습니다.\n"
+                "- 환경변수: `OPENAI_API_KEY=sk-...`\n"
+                "- 또는 `.streamlit/secrets.toml` 의 `[openai] api_key = \"sk-...\"`"
+            )
+        else:
+            st.text(f"source: {ki['source']}  length: {ki['length']}")
+            st.text(f"preview: {ki['preview']}")
+
+        st.markdown("**마지막 GPT-4o-mini 호출**")
+        diag = st.session_state.get(SS_OPENAI_LAST_DIAG)
+        if not diag:
+            st.caption("아직 호출 기록이 없습니다. Convert 를 한 번 실행해 보세요.")
+        else:
+            kind = "✅" if diag.get("ok") else "❌"
+            st.text(f"{kind} stage: {diag.get('stage')}  ({diag.get('ts', '-')})")
+            if diag.get("detail"):
+                st.text(f"detail: {diag['detail']}")
+            if diag.get("raw_preview"):
+                st.code(diag["raw_preview"], language="json")
 
 
 # ---------- 모달 (조회 / 공유 확정 — 같은 컴포넌트 재사용) ----------------------
@@ -1633,9 +1833,9 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
     with left:
         st.markdown("**원본 이미지**")
         if is_share and project.get("_origin_bytes"):
-            st.image(project["_origin_bytes"], use_container_width=True)
+            st.image(project["_origin_bytes"], **_FW)
         elif project.get("origin_path"):
-            st.image(project["origin_path"], use_container_width=True)
+            st.image(project["origin_path"], **_FW)
         else:
             st.caption("(원본 이미지 없음)")
 
@@ -1706,12 +1906,12 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
         )
 
         btn_cols = st.columns([1, 1])
-        if btn_cols[0].button("취소", use_container_width=True, key="modal_cancel"):
+        if btn_cols[0].button("취소", **_FW, key="modal_cancel"):
             st.rerun()
         if btn_cols[1].button(
             "✅ 공유 확정",
             type="primary",
-            use_container_width=True,
+            **_FW,
             key="modal_confirm_share",
         ):
             st.session_state[SS_IS_ANON] = anon
