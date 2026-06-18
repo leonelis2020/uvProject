@@ -47,6 +47,42 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
 
+
+# ── 호환성 shim: streamlit.elements.image.image_to_url ────────────────────────
+# `streamlit-drawable-canvas == 0.9.3` 은 Streamlit 내부의
+# `streamlit.elements.image.image_to_url` 에 의존한다. Streamlit 1.42 부근에서
+# 해당 함수가 다른 모듈로 옮겨졌기 때문에 신버전에서는 캔버스 호출 시
+# `AttributeError: module 'streamlit.elements.image' has no attribute 'image_to_url'`
+# 가 발생한다. 모듈 로드 시점에 신/구 경로를 모두 시도하여 가능하면 복구한다.
+# 실패해도 예외를 던지지 않으며, `_render_mask_canvas_for_region` 가 사각 영역
+# 슬라이더 폴백으로 자연스럽게 전환한다.
+def _patch_streamlit_image_to_url() -> bool:
+    try:
+        import streamlit.elements.image as _img_mod
+    except Exception:
+        return False
+    if hasattr(_img_mod, "image_to_url"):
+        return True
+    for module_path in (
+        "streamlit.elements.lib.image_utils",
+        "streamlit.elements.image_utils",
+    ):
+        try:
+            mod = __import__(module_path, fromlist=["image_to_url"])
+        except Exception:
+            continue
+        fn = getattr(mod, "image_to_url", None)
+        if fn is not None:
+            try:
+                _img_mod.image_to_url = fn  # type: ignore[attr-defined]
+                return True
+            except Exception:
+                continue
+    return False
+
+
+_STREAMLIT_CANVAS_COMPAT_OK = _patch_streamlit_image_to_url()
+
 # =============================================================================
 # PHASE 0: CONNECTION & MASTER LAYER
 #   - 시스템 환경 변수 → secrets.toml 백업 순으로 자격 증명 로드 (기존 로직 보호)
@@ -467,8 +503,114 @@ BUCKET_RESULTS = "results"
 
 
 def ensure_authenticated() -> dict | None:
-    """Supabase Auth 세션 체크."""
+    """Supabase Auth 세션 체크 — `sign_in_user` 가 채워준 `SS_AUTH_USER` 를 반환."""
     return st.session_state.get(SS_AUTH_USER)
+
+
+def _resolve_auth():
+    """`st_supabase_connection` 내부의 supabase-py Auth 클라이언트 추출.
+
+    `_resolve_storage` 와 동일한 방어적 탐색 패턴.
+    """
+    for attr in ("client", "_client", "session", "supabase_client"):
+        candidate = getattr(conn, attr, None)
+        auth = getattr(candidate, "auth", None) if candidate is not None else None
+        if auth is not None:
+            return auth
+    auth = getattr(conn, "auth", None)
+    if auth is None:
+        raise RuntimeError(
+            "Supabase Auth 클라이언트를 찾을 수 없습니다. "
+            "st_supabase_connection 버전을 확인하세요."
+        )
+    return auth
+
+
+def sign_up_user(email: str, password: str, nickname: str) -> str:
+    """이메일 + 비밀번호 회원가입 후 `profiles` 행 생성.
+
+    [규칙]
+      * `auth.sign_up()` → 새 `auth.users` row 생성 (이메일 확인 정책은 Supabase
+        프로젝트 설정에 따름; 확인 필요 시 메일함 안내 메시지를 반환).
+      * 성공 시 `profiles(id, nickname)` 을 UPSERT. 트리거로 자동 생성되는
+        프로젝트라도 nickname 만 덮어쓰므로 충돌이 없다.
+    """
+    if not email or not password:
+        return "❌ 이메일과 비밀번호를 입력하세요."
+    if len(password) < 6:
+        return "❌ 비밀번호는 6자 이상이어야 합니다."
+    try:
+        auth = _resolve_auth()
+        res = auth.sign_up({"email": email, "password": password})
+    except Exception as e:
+        return f"❌ 가입 실패: {e}"
+
+    user_obj = getattr(res, "user", None)
+    user_id = getattr(user_obj, "id", None) if user_obj else None
+    if not user_id:
+        return (
+            "⚠️ 가입은 시도되었으나 사용자 정보를 받지 못했습니다. "
+            "이메일 확인이 필요한 프로젝트일 수 있으니 메일함을 확인하세요."
+        )
+
+    chosen_nick = (nickname or "").strip() or email.split("@")[0]
+    try:
+        conn.table("profiles").upsert(
+            {"id": user_id, "nickname": chosen_nick}
+        ).execute()
+    except Exception:
+        # profiles 가 트리거로 자동 생성되는 환경에서는 무시 가능
+        pass
+
+    return "✅ 회원가입 성공! (확인 메일이 필요한 프로젝트면 메일함을 확인하세요)"
+
+
+def sign_in_user(email: str, password: str) -> str:
+    """이메일 + 비밀번호 로그인 — `SS_AUTH_USER` 에 user 컨텍스트 저장."""
+    if not email or not password:
+        return "❌ 이메일과 비밀번호를 입력하세요."
+    try:
+        auth = _resolve_auth()
+        res = auth.sign_in_with_password({"email": email, "password": password})
+    except Exception as e:
+        return f"❌ 로그인 실패: {e}"
+
+    user_obj = getattr(res, "user", None)
+    user_id = getattr(user_obj, "id", None) if user_obj else None
+    if not user_id:
+        return "❌ 로그인 실패: 사용자 정보를 받지 못했습니다."
+
+    # 닉네임 조회 — profiles 에 없으면 이메일 prefix 로 fallback
+    nickname: str | None = None
+    try:
+        prof = (
+            conn.table("profiles")
+            .select("nickname")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if prof.data:
+            nickname = prof.data[0].get("nickname")
+    except Exception:
+        pass
+
+    st.session_state[SS_AUTH_USER] = {
+        "id": user_id,
+        "email": getattr(user_obj, "email", email),
+        "nickname": nickname or email.split("@")[0],
+    }
+    return "✅ 로그인 완료"
+
+
+def sign_out_user() -> None:
+    """Supabase Auth 세션 종료 + `SS_AUTH_USER` 초기화."""
+    try:
+        auth = _resolve_auth()
+        auth.sign_out()
+    except Exception:
+        pass
+    st.session_state.pop(SS_AUTH_USER, None)
 
 
 def _resolve_storage():
@@ -753,35 +895,84 @@ def request_project_deletion(project_id: str, created_at_iso: str, scrap_count: 
 # UI COMPONENTS
 # =============================================================================
 
-# ---------- 좌측 사이드바: 프로필 + 라인업 ---------------------------------------
+# ---------- 좌측 사이드바: 인증 + 라인업 ----------------------------------------
 def render_sidebar() -> None:
-    """좌측: 프로필 + '내가 공유한' / '남이 공유한' 미리보기 라인업.
+    """좌측: 인증 패널 + '내가 공유한' / '남이 공유한' 미리보기 라인업.
 
-    프로필 이미지는 현재 보류(요구사항). 닉네임 + UID 만 노출.
+    프로필 이미지는 보류(요구사항). 닉네임 + UID 만 노출.
     """
-    user = ensure_authenticated() or {}
     with st.sidebar:
-        col_a, col_b = st.columns([3, 1])
-        with col_a:
-            st.markdown(f"**{user.get('nickname') or 'user_nickname'}**")
-            st.caption(f"@{(user.get('id') or 'user_UID')[:8]}")
-        with col_b:
-            st.button("⚙️", key="open_settings", help="설정")
-
+        _render_auth_panel()
         st.divider()
 
-        st.caption("내가 공유한 미리보기")
-        _render_lineup(
-            fetch_my_shared_projects(user.get("id"), limit=10),
-            key_prefix="mine",
-        )
+        user = ensure_authenticated()
+        if user:
+            st.caption("내가 공유한 미리보기")
+            _render_lineup(
+                fetch_my_shared_projects(user.get("id"), limit=10),
+                key_prefix="mine",
+            )
+            st.divider()
 
-        st.divider()
         st.caption("내가 공유받은(남이 공유한) 미리보기")
         _render_lineup(
-            fetch_others_shared_projects(user.get("id"), limit=10),
+            fetch_others_shared_projects((user or {}).get("id"), limit=10),
             key_prefix="others",
         )
+
+
+def _render_auth_panel() -> None:
+    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + 로그아웃 (인증)."""
+    user = ensure_authenticated()
+    if user:
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            st.markdown(f"**{user.get('nickname') or user.get('email') or 'user'}**")
+            uid_short = (user.get("id") or "")[:8]
+            st.caption(f"@{uid_short or 'user_UID'}")
+        with col_b:
+            if st.button("⎋", key="signout_btn", help="로그아웃", use_container_width=True):
+                sign_out_user()
+                st.rerun()
+        return
+
+    # ── 비로그인 상태 — 인라인 폼 ──────────────────────────────────────────
+    st.markdown("**🔐 로그인 / 회원가입**")
+    tab_in, tab_up = st.tabs(["로그인", "회원가입"])
+
+    with tab_in:
+        with st.form("signin_form", clear_on_submit=False):
+            in_email = st.text_input("이메일", key="signin_email")
+            in_pwd = st.text_input("비밀번호", type="password", key="signin_pwd")
+            submitted_in = st.form_submit_button(
+                "로그인", use_container_width=True, type="primary"
+            )
+        if submitted_in:
+            msg = sign_in_user(in_email, in_pwd)
+            if msg.startswith("✅"):
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    with tab_up:
+        with st.form("signup_form", clear_on_submit=False):
+            up_email = st.text_input("이메일", key="signup_email")
+            up_pwd = st.text_input(
+                "비밀번호 (6자 이상)", type="password", key="signup_pwd"
+            )
+            up_nick = st.text_input("닉네임 (선택)", key="signup_nick")
+            submitted_up = st.form_submit_button(
+                "가입", use_container_width=True
+            )
+        if submitted_up:
+            msg = sign_up_user(up_email, up_pwd, up_nick)
+            if msg.startswith("✅"):
+                st.success(msg)
+            elif msg.startswith("⚠️"):
+                st.warning(msg)
+            else:
+                st.error(msg)
 
 
 def _render_lineup(items: list[dict], key_prefix: str) -> None:
@@ -824,7 +1015,7 @@ def render_original_image_panel() -> None:
     with st.container(border=True):
         img = st.session_state.get(SS_ORIGIN_IMAGE)
         if img is not None:
-            st.image(img, use_column_width=True)
+            st.image(img, use_container_width=True)
         else:
             st.markdown(
                 "<div style='height:320px;display:flex;align-items:center;"
@@ -969,16 +1160,16 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
         )
     except AttributeError as exc:
         if "image_to_url" in str(exc) or "streamlit.elements.image" in str(exc):
-            st.error(
-                "현재 설치된 Streamlit 버전이 `streamlit-drawable-canvas`와 호환되지 않습니다.\n"
-                "requirements.txt에 따라 Streamlit을 1.55.x 이하로 설치한 뒤 다시 실행하세요."
-            )
+            # Streamlit 신버전 비호환 — bbox 슬라이더 폴백.
+            _render_bbox_mask_fallback(region_index, region, img_pil)
             return
         raise
     except Exception as exc:
-        st.error(
-            f"`streamlit-drawable-canvas` 실행 중 오류가 발생했습니다: {exc}"
+        st.warning(
+            f"`streamlit-drawable-canvas` 실행 중 오류가 발생했습니다: {exc}\n"
+            "사각 영역 슬라이더로 대체합니다."
         )
+        _render_bbox_mask_fallback(region_index, region, img_pil)
         return
 
     # canvas 알파 채널을 이진화 → 실제 이미지 좌표계로 INTER_NEAREST 리사이즈
@@ -992,6 +1183,75 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
     raw_mask = (raw_alpha > 0).astype(np.uint8)
     mask_native = cv2.resize(raw_mask, (iw, ih), interpolation=cv2.INTER_NEAREST)
     region["mask"] = mask_native.astype(bool)
+
+
+def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None:
+    """캔버스 마우스 트래킹이 동작하지 않을 때의 사각 영역 마스크 UI.
+
+    4개 슬라이더 (left / right / top / bottom %) 로 사각 영역을 지정하고,
+    해당 boolean 마스크를 `region['mask']` 에 저장한다. 시각 피드백을 위해
+    오렌지 오버레이 + 테두리가 그려진 미리보기를 함께 노출한다.
+
+    freedraw 가 아니라 사각형뿐인 점은 명확한 제약이며, 사용자가 보기에
+    "왜 안 칠해지나" 가 아니라 "이 영역에 매핑한다" 로 흐름이 보존된다.
+    """
+    if Image is None or np is None:
+        st.warning("Pillow / numpy 가 필요합니다 (requirements 설치).")
+        return
+
+    iw, ih = img_pil.size  # PIL: (W, H)
+
+    st.info(
+        "🖱️ 캔버스 마우스 트래킹이 현재 Streamlit 버전과 비호환이라 "
+        "사각 영역 슬라이더로 대체합니다. 슬라이더로 영역을 지정하면 즉시 "
+        "마스크가 적용됩니다."
+    )
+
+    bcols = st.columns(2)
+    with bcols[0]:
+        x1 = st.slider(
+            "좌측 (%)", 0, 99, 10, key=f"bbox_x1_{region_index}"
+        )
+        y1 = st.slider(
+            "상단 (%)", 0, 99, 10, key=f"bbox_y1_{region_index}"
+        )
+    with bcols[1]:
+        x2 = st.slider(
+            "우측 (%)", 1, 100, 90, key=f"bbox_x2_{region_index}"
+        )
+        y2 = st.slider(
+            "하단 (%)", 1, 100, 90, key=f"bbox_y2_{region_index}"
+        )
+
+    if x1 >= x2 or y1 >= y2:
+        st.warning("범위가 올바르지 않습니다 (좌측 < 우측, 상단 < 하단).")
+        region["mask"] = None
+        return
+
+    px1, px2 = int(iw * x1 / 100), int(iw * x2 / 100)
+    py1, py2 = int(ih * y1 / 100), int(ih * y2 / 100)
+
+    mask = np.zeros((ih, iw), dtype=bool)
+    mask[py1:py2, px1:px2] = True
+    region["mask"] = mask
+
+    # 시각 피드백 — 반투명 오버레이 + 테두리
+    arr = np.asarray(img_pil.convert("RGB")).copy()
+    overlay_color = np.array([255, 165, 0], dtype=np.float32)
+    region_slice = arr[py1:py2, px1:px2].astype(np.float32)
+    blended = np.clip(region_slice * 0.55 + overlay_color * 0.45, 0, 255).astype(np.uint8)
+    arr[py1:py2, px1:px2] = blended
+    border_w = max(2, int(min(iw, ih) * 0.004))
+    arr[py1:py1 + border_w, px1:px2] = overlay_color
+    arr[py2 - border_w:py2, px1:px2] = overlay_color
+    arr[py1:py2, px1:px1 + border_w] = overlay_color
+    arr[py1:py2, px2 - border_w:px2] = overlay_color
+
+    st.image(Image.fromarray(arr), use_container_width=True)
+    st.caption(
+        f"마스크 영역: {(x2 - x1)}% × {(y2 - y1)}%  "
+        f"({px2 - px1} × {py2 - py1} px = {int(mask.sum())} 픽셀)"
+    )
 
 
 def _render_illuminant_tag_grid() -> None:
@@ -1026,7 +1286,7 @@ def render_converted_image_panel() -> None:
     with st.container(border=True):
         result = st.session_state.get(SS_RESULT_BYTES)
         if result:
-            st.image(result, use_column_width=True)
+            st.image(result, use_container_width=True)
         else:
             st.markdown(
                 "<div style='height:240px;display:flex;align-items:center;"
@@ -1249,9 +1509,9 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
     with left:
         st.markdown("**원본 이미지**")
         if is_share and project.get("_origin_bytes"):
-            st.image(project["_origin_bytes"], use_column_width=True)
+            st.image(project["_origin_bytes"], use_container_width=True)
         elif project.get("origin_path"):
-            st.image(project["origin_path"], use_column_width=True)
+            st.image(project["origin_path"], use_container_width=True)
         else:
             st.caption("(원본 이미지 없음)")
 
