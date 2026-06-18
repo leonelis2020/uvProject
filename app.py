@@ -824,7 +824,7 @@ def render_original_image_panel() -> None:
     with st.container(border=True):
         img = st.session_state.get(SS_ORIGIN_IMAGE)
         if img is not None:
-            st.image(img, use_column_width=True)
+            st.image(img, use_container_width=True)
         else:
             st.markdown(
                 "<div style='height:320px;display:flex;align-items:center;"
@@ -1026,7 +1026,7 @@ def render_converted_image_panel() -> None:
     with st.container(border=True):
         result = st.session_state.get(SS_RESULT_BYTES)
         if result:
-            st.image(result, use_column_width=True)
+            st.image(result, use_container_width=True)
         else:
             st.markdown(
                 "<div style='height:240px;display:flex;align-items:center;"
@@ -1249,9 +1249,9 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
     with left:
         st.markdown("**원본 이미지**")
         if is_share and project.get("_origin_bytes"):
-            st.image(project["_origin_bytes"], use_column_width=True)
+            st.image(project["_origin_bytes"], use_container_width=True)
         elif project.get("origin_path"):
-            st.image(project["origin_path"], use_column_width=True)
+            st.image(project["origin_path"], use_container_width=True)
         else:
             st.caption("(원본 이미지 없음)")
 
