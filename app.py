@@ -23,6 +23,7 @@ Fat-Client (Streamlit) + Thin-DB (Supabase) 스카폴딩.
 from __future__ import annotations
 
 import io
+import json
 import os
 import uuid
 from datetime import datetime, timedelta
@@ -69,6 +70,24 @@ conn = st.connection(
     url=s_url,
     key=s_key,
 )
+
+
+def _get_openai_key() -> str | None:
+    """OpenAI API 키 하이브리드 조회 — Supabase 자격 증명과 동일한 정책.
+
+    1순위: 환경 변수 `OPENAI_API_KEY` (배포 환경 / Codespaces 시크릿)
+    2순위: `.streamlit/secrets.toml` 의 `[openai] api_key = "..."`
+
+    프로세스가 시작될 때마다 조회되지 않고 매 호출마다 갱신을 허용한다
+    (Streamlit hot-reload 시 secrets 가 갱신될 수 있음).
+    """
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets["openai"]["api_key"]  # type: ignore[index]
+    except Exception:
+        return None
 
 
 # -----------------------------------------------------------------------------
@@ -227,22 +246,83 @@ def validate_matrix_payload(payload: Any) -> bool:
     return True
 
 
-def call_gpt4o_mini_for_matrix(rag_context: dict) -> dict:
+_MATRIX_SYSTEM_PROMPT = (
+    "You are a color-science assistant. Given a target subject's spectral reflectance "
+    "(typically 300–700 nm, 41 points, scaled 0–1) and an illuminant's spectral power "
+    "distribution (SPD), produce a 3x4 affine RGB color transformation matrix that "
+    "simulates how the subject would appear under the given illuminant when its UV/IR "
+    "reflectance is translated into the visible sRGB band.\n\n"
+    "Return STRICT JSON ONLY (no prose, no markdown fences) with this exact shape:\n"
+    '{"r":[r0,r1,r2,bias],"g":[g0,g1,g2,bias],"b":[b0,b1,b2,bias]}\n\n'
+    "All twelve values are floats in [-2.0, 2.0]. The matrix is applied to the "
+    "homogeneous pixel vector [r, g, b, 1] in sRGB float [0, 1] as out = M @ [r,g,b,1]. "
+    "If you have low confidence, return values close to the identity matrix "
+    "(diagonals ≈ 1, off-diagonals ≈ 0, bias ≈ 0)."
+)
+
+
+def call_gpt4o_mini_for_matrix(
+    rag_context: dict,
+    *,
+    max_retries: int = 1,
+    temperature: float = 0.2,
+) -> dict:
     """GPT-4o-mini 호출 → 3x4 변환 행렬 JSON. **이미지는 전달하지 않는다.**
 
-    NOTE (PHASE 2 확장 지점):
-      * `from openai import OpenAI`
-      * `client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or st.secrets["openai"]["api_key"])`
-      * `client.chat.completions.create(`
-            `model="gpt-4o-mini",`
-            `response_format={"type":"json_object"},`
-            `messages=[{"role":"system","content": SYSTEM_PROMPT},`
-            `          {"role":"user","content": json.dumps(rag_context)}])`
-      * 반환 직후 반드시 `validate_matrix_payload()` 로 검증하고,
-        실패 시 1회 retry → 그래도 실패하면 항등행렬을 fallback 으로 반환.
+    Flow:
+      1. env-var → secrets.toml 하이브리드로 OPENAI_API_KEY 조회.
+      2. RAG context 를 `_MATRIX_SYSTEM_PROMPT` + JSON 사용자 메시지로 합성.
+      3. `response_format={"type":"json_object"}` 로 강제 JSON 응답.
+      4. `validate_matrix_payload()` 통과 시 즉시 반환.
+      5. 실패 시 최대 `max_retries` 회 재시도 (temperature 동일).
+      6. 끝까지 실패하면 IDENTITY 를 반환 (예외를 던지지 않음 →
+         `_run_convert_multi` 의 부분 실패 격리 정책과 일관).
     """
-    # TODO[PHASE-2]: 실제 OpenAI 호출 구현 (gpt-4o-mini, JSON-only, 텍스트 입력)
-    raise NotImplementedError("PHASE 2: GPT-4o-mini 호출 로직 미구현 (스카폴딩 슬롯)")
+    api_key = _get_openai_key()
+    if not api_key:
+        # 환경/시크릿 모두 비어 있으면 IDENTITY 로 graceful degrade.
+        # (시연용 RLS 정책과 동일한 톤 — 키 없이도 앱이 꺾이지 않게)
+        return dict(IDENTITY)
+
+    try:
+        from openai import OpenAI
+    except Exception:
+        return dict(IDENTITY)
+
+    client = OpenAI(api_key=api_key)
+    user_payload = {
+        "subject": rag_context.get("subject"),
+        "illuminant": rag_context.get("illuminant"),
+    }
+
+    for _attempt in range(max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": _MATRIX_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(user_payload, ensure_ascii=False),
+                    },
+                ],
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            if not content:
+                continue
+            payload = json.loads(content)
+            if validate_matrix_payload(payload):
+                return payload
+        except json.JSONDecodeError:
+            continue
+        except Exception:
+            # 네트워크 / 레이트리밋 / 인증 등 — 다음 시도 또는 fallback
+            continue
+
+    # 모든 시도 실패 → IDENTITY (멀티리전 합성에서 그 영역만 변환 없이 진행)
+    return dict(IDENTITY)
 
 
 # Backward-compat alias — 기존에 이미지 인자를 받던 시그니처가 코드 어딘가에 박혀있을 수
@@ -1042,16 +1122,16 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
             subj = region.get("subject") or {}
             ctx = build_rag_context(subj, illu)
             try:
+                # call_gpt4o_mini_for_matrix 는 키 부재/네트워크 오류 시
+                # 예외를 던지지 않고 IDENTITY 를 반환한다. 따라서 여기서는
+                # 진짜 예외(런타임 에러)만 잡아내면 충분하다.
                 matrix = call_gpt4o_mini_for_matrix(ctx)
-            except NotImplementedError:
-                st.info("PHASE 2: GPT-4o-mini 호출이 미구현 상태 → IDENTITY 로 진행합니다.")
-                matrix = IDENTITY
-            except Exception as e:
+            except Exception as e:  # pragma: no cover - defensive
                 st.warning(f"AI 호출 실패 ({subj.get('label')}): {e} → IDENTITY 로 진행.")
-                matrix = IDENTITY
+                matrix = dict(IDENTITY)
 
             if not validate_matrix_payload(matrix):
-                matrix = IDENTITY
+                matrix = dict(IDENTITY)
                 fallback_count += 1
 
             region["matrix"] = matrix
