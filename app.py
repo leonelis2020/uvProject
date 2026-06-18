@@ -814,17 +814,31 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
         key=f"stroke_{region_index}",
     )
 
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 165, 0, 0.3)",
-        stroke_width=stroke,
-        stroke_color="#FFA500",
-        background_image=img_pil,
-        update_streamlit=True,
-        width=DISPLAY_W,
-        height=disp_h,
-        drawing_mode="freedraw",
-        key=f"canvas_region_{region_index}",
-    )
+    try:
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 165, 0, 0.3)",
+            stroke_width=stroke,
+            stroke_color="#FFA500",
+            background_image=img_pil,
+            update_streamlit=True,
+            width=DISPLAY_W,
+            height=disp_h,
+            drawing_mode="freedraw",
+            key=f"canvas_region_{region_index}",
+        )
+    except AttributeError as exc:
+        if "image_to_url" in str(exc) or "streamlit.elements.image" in str(exc):
+            st.error(
+                "현재 설치된 Streamlit 버전이 `streamlit-drawable-canvas`와 호환되지 않습니다.\n"
+                "requirements.txt에 따라 Streamlit을 1.55.x 이하로 설치한 뒤 다시 실행하세요."
+            )
+            return
+        raise
+    except Exception as exc:
+        st.error(
+            f"`streamlit-drawable-canvas` 실행 중 오류가 발생했습니다: {exc}"
+        )
+        return
 
     # canvas 알파 채널을 이진화 → 실제 이미지 좌표계로 INTER_NEAREST 리사이즈
     if canvas_result is None or canvas_result.image_data is None:
