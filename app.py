@@ -93,8 +93,8 @@ def _get_openai_key() -> str | None:
     1순위: 환경 변수 `OPENAI_API_KEY` (배포 환경 / Codespaces 시크릿)
     2순위: `.streamlit/secrets.toml` 의 `[openai] api_key = "..."`
 
-    프로세스가 시작될 때마다 조회되지 않고 매 호출마다 갱신을 허용한다
-    (Streamlit hot-reload 시 secrets 가 갱신될 수 있음).
+    `_openai_key_info()` 는 같은 우선순위를 따르되 어디서 키가 왔는지
+    + 키의 접두/접미만 추출해 진단용으로 반환한다.
     """
     key = os.environ.get("OPENAI_API_KEY")
     if key:
@@ -103,6 +103,28 @@ def _get_openai_key() -> str | None:
         return st.secrets["openai"]["api_key"]  # type: ignore[index]
     except Exception:
         return None
+
+
+def _openai_key_info() -> dict:
+    """진단용 — 키의 출처(env/secrets/없음) + 길이 + 마스킹된 미리보기."""
+    src = None
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        src = "env"
+    else:
+        try:
+            key = st.secrets["openai"]["api_key"]  # type: ignore[index]
+            src = "secrets"
+        except Exception:
+            key = None
+    if not key:
+        return {"source": None, "length": 0, "preview": None}
+    preview = f"{key[:6]}…{key[-4:]}" if len(key) > 10 else "***"
+    return {"source": src, "length": len(key), "preview": preview}
+
+
+# 마지막 OpenAI 호출 진단 — 설정 모달의 'AI 진단' 섹션이 표시
+SS_OPENAI_LAST_DIAG = "openai_last_diag"
 
 
 # -----------------------------------------------------------------------------
@@ -276,6 +298,14 @@ _MATRIX_SYSTEM_PROMPT = (
 )
 
 
+def _record_openai_diag(**kv) -> None:
+    """OpenAI 호출 직후 진단 상태를 session_state 에 적재. 설정 모달이 표시."""
+    diag = st.session_state.get(SS_OPENAI_LAST_DIAG) or {}
+    diag.update(kv)
+    diag["ts"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    st.session_state[SS_OPENAI_LAST_DIAG] = diag
+
+
 def call_gpt4o_mini_for_matrix(
     rag_context: dict,
     *,
@@ -289,28 +319,55 @@ def call_gpt4o_mini_for_matrix(
       2. RAG context 를 `_MATRIX_SYSTEM_PROMPT` + JSON 사용자 메시지로 합성.
       3. `response_format={"type":"json_object"}` 로 강제 JSON 응답.
       4. `validate_matrix_payload()` 통과 시 즉시 반환.
-      5. 실패 시 최대 `max_retries` 회 재시도 (temperature 동일).
+      5. 실패 시 최대 `max_retries` 회 재시도.
       6. 끝까지 실패하면 IDENTITY 를 반환 (예외를 던지지 않음 →
          `_run_convert_multi` 의 부분 실패 격리 정책과 일관).
+
+    [진단성]
+      모든 분기에서 `_record_openai_diag(...)` 로 마지막 호출의 상태를 저장한다.
+      "API 키 넣었는데 OpenAI 대시보드에 호출이 안 잡힘" 같은 시연 보고를
+      빠르게 식별할 수 있도록 설정 모달의 AI 진단 패널에 노출된다.
     """
     api_key = _get_openai_key()
     if not api_key:
-        # 환경/시크릿 모두 비어 있으면 IDENTITY 로 graceful degrade.
-        # (시연용 RLS 정책과 동일한 톤 — 키 없이도 앱이 꺾이지 않게)
+        _record_openai_diag(
+            stage="no_api_key",
+            ok=False,
+            detail=(
+                "OPENAI_API_KEY 환경변수도 없고 .streamlit/secrets.toml 의 "
+                "[openai] api_key 도 없습니다."
+            ),
+        )
         return dict(IDENTITY)
 
     try:
         from openai import OpenAI
-    except Exception:
+    except Exception as e:
+        _record_openai_diag(
+            stage="openai_import_failed",
+            ok=False,
+            detail=f"openai 패키지 import 실패: {type(e).__name__}: {e}",
+        )
         return dict(IDENTITY)
 
-    client = OpenAI(api_key=api_key)
+    try:
+        client = OpenAI(api_key=api_key)
+    except Exception as e:
+        _record_openai_diag(
+            stage="client_init_failed",
+            ok=False,
+            detail=f"OpenAI 클라이언트 초기화 실패: {type(e).__name__}: {e}",
+        )
+        return dict(IDENTITY)
+
     user_payload = {
         "subject": rag_context.get("subject"),
         "illuminant": rag_context.get("illuminant"),
     }
 
-    for _attempt in range(max_retries + 1):
+    last_err: str | None = None
+    last_raw: str | None = None
+    for attempt in range(max_retries + 1):
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -325,18 +382,40 @@ def call_gpt4o_mini_for_matrix(
                 ],
             )
             content = (resp.choices[0].message.content or "").strip()
+            last_raw = content[:200]
             if not content:
+                last_err = "empty response content"
                 continue
             payload = json.loads(content)
             if validate_matrix_payload(payload):
+                _record_openai_diag(
+                    stage="ok",
+                    ok=True,
+                    detail=(
+                        f"매트릭스 수신 OK (시도 {attempt + 1}/{max_retries + 1})"
+                    ),
+                    raw_preview=last_raw,
+                    model="gpt-4o-mini",
+                )
                 return payload
-        except json.JSONDecodeError:
+            last_err = "schema validation failed"
+        except json.JSONDecodeError as e:
+            last_err = f"json decode: {e}"
             continue
-        except Exception:
-            # 네트워크 / 레이트리밋 / 인증 등 — 다음 시도 또는 fallback
+        except Exception as e:
+            # 네트워크 / 레이트리밋 / 인증 등 — 예외 타입까지 보존
+            last_err = f"{type(e).__name__}: {e}"
             continue
 
-    # 모든 시도 실패 → IDENTITY (멀티리전 합성에서 그 영역만 변환 없이 진행)
+    _record_openai_diag(
+        stage="failed",
+        ok=False,
+        detail=(
+            f"모든 시도 실패 (총 {max_retries + 1}회). 마지막 에러: {last_err}"
+        ),
+        raw_preview=last_raw,
+        model="gpt-4o-mini",
+    )
     return dict(IDENTITY)
 
 
@@ -1684,6 +1763,41 @@ def show_settings_modal() -> None:
             st.rerun()
         else:
             st.error(msg)
+
+    # ── 진단 패널 ─────────────────────────────────────────────────────────
+    st.divider()
+    with st.expander("🔧 연결 / AI 진단", expanded=False):
+        st.markdown("**Supabase**")
+        st.text(f"URL: {s_url or '(미설정)'}")
+        st.text(f"user_id (full): {user.get('id') or '(없음)'}")
+        st.caption(
+            "Supabase Dashboard 의 URL 과 비교하세요. "
+            "다르면 다른 프로젝트에 가입/저장되고 있는 것입니다."
+        )
+
+        st.markdown("**OpenAI API 키**")
+        ki = _openai_key_info()
+        if not ki["source"]:
+            st.error(
+                "키가 로드되지 않았습니다.\n"
+                "- 환경변수: `OPENAI_API_KEY=sk-...`\n"
+                "- 또는 `.streamlit/secrets.toml` 의 `[openai] api_key = \"sk-...\"`"
+            )
+        else:
+            st.text(f"source: {ki['source']}  length: {ki['length']}")
+            st.text(f"preview: {ki['preview']}")
+
+        st.markdown("**마지막 GPT-4o-mini 호출**")
+        diag = st.session_state.get(SS_OPENAI_LAST_DIAG)
+        if not diag:
+            st.caption("아직 호출 기록이 없습니다. Convert 를 한 번 실행해 보세요.")
+        else:
+            kind = "✅" if diag.get("ok") else "❌"
+            st.text(f"{kind} stage: {diag.get('stage')}  ({diag.get('ts', '-')})")
+            if diag.get("detail"):
+                st.text(f"detail: {diag['detail']}")
+            if diag.get("raw_preview"):
+                st.code(diag["raw_preview"], language="json")
 
 
 # ---------- 모달 (조회 / 공유 확정 — 같은 컴포넌트 재사용) ----------------------
