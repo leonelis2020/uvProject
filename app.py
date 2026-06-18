@@ -1321,9 +1321,40 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
         ):
             st.session_state[SS_IS_ANON] = anon
             st.session_state[SS_IS_PALETTE_PUBLIC] = pal_pub
-            # TODO[PHASE-4]: upload_to_storage 로 원본/결과 업로드 → URL 획득
-            origin_url = "https://example.com/origin.png"
-            result_url = "https://example.com/result.png"
+
+            # ── 원본/결과 이미지를 Supabase Storage 에 업로드 ────────────────
+            #   /originals/{uuid}/origin.png
+            #   /results/{uuid}/result.png
+            # 같은 UUID 를 prefix 로 묶어 한 프로젝트의 원본↔결과 매핑을 보존한다.
+            doc_uuid = str(uuid.uuid4())
+            origin_bytes = project.get("_origin_bytes")
+            result_bytes = project.get("_result_bytes")
+
+            origin_url: str | None = None
+            result_url: str | None = None
+            if origin_bytes:
+                try:
+                    origin_url = upload_to_storage(
+                        BUCKET_ORIGINALS,
+                        f"{doc_uuid}/origin.png",
+                        origin_bytes,
+                    )
+                except Exception as e:
+                    st.warning(f"원본 Storage 업로드 실패: {e}")
+            if result_bytes:
+                try:
+                    result_url = upload_to_storage(
+                        BUCKET_RESULTS,
+                        f"{doc_uuid}/result.png",
+                        result_bytes,
+                    )
+                except Exception as e:
+                    st.warning(f"결과 Storage 업로드 실패: {e}")
+
+            if not origin_url:
+                # origin_path 컬럼은 NOT NULL 이므로 최소한 placeholder 라도 채운다.
+                origin_url = f"local://{doc_uuid}/origin.png"
+
             user = ensure_authenticated() or {}
             msg = save_simulation_result(
                 user_id=user.get("id"),
