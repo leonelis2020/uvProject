@@ -592,6 +592,39 @@ def sign_out_user() -> None:
     st.session_state.pop(SS_AUTH_USER, None)
 
 
+def update_user_nickname(user_id: str, new_nickname: str) -> str:
+    """`profiles.nickname` UPDATE 후 메시지 반환.
+
+    Caller (`show_settings_modal`) 가 성공 시 `SS_AUTH_USER.nickname` 도
+    같이 갱신해서 사이드바가 즉시 새 닉네임으로 보이게 한다.
+    """
+    cleaned = (new_nickname or "").strip()
+    if not cleaned:
+        return "❌ 닉네임은 비어 있을 수 없습니다."
+    if len(cleaned) > 50:
+        return "❌ 닉네임은 50자 이내로 입력하세요."
+    try:
+        resp = (
+            conn.table("profiles")
+            .update({"nickname": cleaned})
+            .eq("id", user_id)
+            .execute()
+        )
+    except Exception as e:
+        return f"❌ 닉네임 변경 실패: {e}"
+
+    # 일부 환경에서는 profiles 행이 아직 없어 UPDATE 가 0건일 수 있음 — UPSERT 폴백
+    if not getattr(resp, "data", None):
+        try:
+            conn.table("profiles").upsert(
+                {"id": user_id, "nickname": cleaned}
+            ).execute()
+        except Exception as e:
+            return f"❌ profiles 행이 없어 UPSERT 도 실패: {e}"
+
+    return f"✅ 닉네임이 '{cleaned}' 으로 변경되었습니다."
+
+
 def _resolve_storage():
     """`st_supabase_connection` 내부의 supabase-py Storage 클라이언트를 안전하게 추출.
 
@@ -901,16 +934,29 @@ def render_sidebar() -> None:
 
 
 def _render_auth_panel() -> None:
-    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + 로그아웃 (인증)."""
+    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + ⚙️ + ⎋ (인증)."""
     user = ensure_authenticated()
     if user:
-        col_a, col_b = st.columns([3, 1])
+        col_a, col_b, col_c = st.columns([4, 1, 1])
         with col_a:
             st.markdown(f"**{user.get('nickname') or user.get('email') or 'user'}**")
             uid_short = (user.get("id") or "")[:8]
             st.caption(f"@{uid_short or 'user_UID'}")
         with col_b:
-            if st.button("⎋", key="signout_btn", help="로그아웃", use_container_width=True):
+            if st.button(
+                "⚙️",
+                key="settings_btn",
+                help="설정 (닉네임 변경)",
+                use_container_width=True,
+            ):
+                show_settings_modal()
+        with col_c:
+            if st.button(
+                "⎋",
+                key="signout_btn",
+                help="로그아웃",
+                use_container_width=True,
+            ):
                 sign_out_user()
                 st.rerun()
         return
@@ -1465,6 +1511,54 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
         )
     st.success(f"✅ 변환 완료 · {len(regions)}개 영역 합성")
     st.rerun()
+
+
+# ---------- 모달: 설정 (⚙️) — 닉네임 편집 -------------------------------------
+@st.dialog("⚙️ 설정", width="small")
+def show_settings_modal() -> None:
+    """사이드바 ⚙️ 버튼이 여는 설정 모달.
+
+    현재 지원: 닉네임 변경 (`profiles.nickname` UPDATE/UPSERT).
+    저장 시 `SS_AUTH_USER.nickname` 도 함께 갱신하여 사이드바 표시가 즉시 반영된다.
+    """
+    user = ensure_authenticated()
+    if not user:
+        st.warning("로그인이 필요합니다.")
+        return
+
+    st.markdown(f"**계정**: `{user.get('email') or '-'}`")
+    st.caption(f"@{(user.get('id') or '')[:8]}")
+    st.divider()
+
+    current_nick = user.get("nickname") or ""
+    new_nick = st.text_input(
+        "닉네임",
+        value=current_nick,
+        key="settings_nickname_input",
+        max_chars=50,
+    )
+
+    btn_cols = st.columns([1, 1])
+    if btn_cols[0].button("취소", key="settings_cancel", use_container_width=True):
+        st.rerun()
+    if btn_cols[1].button(
+        "저장",
+        key="settings_save",
+        type="primary",
+        use_container_width=True,
+        disabled=(new_nick.strip() == current_nick.strip()),
+    ):
+        msg = update_user_nickname(user["id"], new_nick)
+        if msg.startswith("✅"):
+            # 사이드바 즉시 반영
+            st.session_state[SS_AUTH_USER] = {
+                **user,
+                "nickname": new_nick.strip(),
+            }
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
 
 
 # ---------- 모달 (조회 / 공유 확정 — 같은 컴포넌트 재사용) ----------------------
