@@ -618,15 +618,37 @@ def _supabase_url_suffix(n: int = 18) -> str:
         return "?"
 
 
-_PROFILES_RLS_SQL = (
-    "ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;\n"
-    "CREATE POLICY \"profiles_insert_all\" ON public.profiles "
-    "FOR INSERT WITH CHECK (true);\n"
-    "CREATE POLICY \"profiles_update_all\" ON public.profiles "
-    "FOR UPDATE USING (true);\n"
-    "CREATE POLICY \"profiles_select_all\" ON public.profiles "
-    "FOR SELECT USING (true);"
-)
+# ── profiles 셋업 SQL — 운영자가 Supabase SQL Editor 에 1회만 실행 ─────────────
+# strict RLS (자기 행만 INSERT/UPDATE 가능) + SECURITY DEFINER 트리거 조합.
+# 트리거가 가입 시점에 RLS 를 우회해 profiles 행을 즉시 만들어 주므로
+# email-confirmation ON 환경(session=None) 에서도 가입이 막히지 않는다.
+_PROFILES_SETUP_SQL = """ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can insert own profile" ON public.profiles
+  FOR INSERT WITH CHECK (auth.uid() = id);
+CREATE POLICY "Profiles are viewable by everyone" ON public.profiles
+  FOR SELECT USING (true);
+CREATE POLICY "Users can update own profile" ON public.profiles
+  FOR UPDATE USING (auth.uid() = id);
+
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public AS $$
+BEGIN
+  INSERT INTO public.profiles (id, nickname)
+  VALUES (
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data->>'nickname',
+             'user_' || substr(NEW.id::text, 1, 8))
+  )
+  ON CONFLICT (id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();"""
 
 
 def _is_rls_error(err: Exception | str) -> bool:
@@ -640,25 +662,39 @@ def _is_rls_error(err: Exception | str) -> bool:
 
 
 def _rls_guidance(table: str) -> str:
-    """RLS 차단 시 사용자에게 어디에 무슨 SQL 을 붙여넣을지 안내."""
+    """RLS 차단 시 사용자에게 어디에 무슨 SQL 을 붙여넣을지 안내.
+
+    이 메시지가 보이면 운영자가 Supabase SQL Editor 에 본 프로젝트의 표준
+    profiles 셋업 SQL (strict RLS + SECURITY DEFINER 트리거) 을 아직 적용하지
+    않았다는 신호다. 적용 후엔 가입 시 트리거가 profiles 행을 자동 생성해
+    이 분기 자체가 호출되지 않는다.
+    """
     return (
         f"🔒 Postgres RLS 가 `public.{table}` 의 쓰기를 막고 있습니다.\n"
-        f"Supabase Dashboard → SQL Editor 에 아래를 붙여넣고 실행해 주세요"
-        f"(기존 projects/palettes 와 같은 'open for testing' 정책):\n\n"
-        f"```sql\n{_PROFILES_RLS_SQL}\n```"
+        f"Supabase Dashboard → SQL Editor 에 아래를 1회 실행해 주세요"
+        f"(strict RLS + 자동 생성 트리거):\n\n"
+        f"```sql\n{_PROFILES_SETUP_SQL}\n```"
     )
 
 
 def sign_up_user(email: str, password: str, nickname: str) -> str:
-    """이메일 + 비밀번호 회원가입 후 `profiles` 행 생성.
+    """이메일 + 비밀번호 회원가입.
 
-    [핵심 동작]
-      * `auth.sign_up()` → `auth.users` row 생성/조회. supabase-py v2 는 이미
-        존재하는 이메일에 대해 **예외를 던지지 않는다** — 응답은 받지만
-        `res.session = None` 이고 종종 `user_obj.identities == []` 가 된다.
-        이 두 시그널로 'duplicate' vs 'fresh signup' 을 구분한다.
-      * 새 가입이면 `profiles(id, nickname)` 을 UPSERT (RLS 차단 시
-        명시적 SQL 안내 반환).
+    [본 프로젝트의 가입 흐름 — strict RLS + 자동 생성 트리거]
+      * `auth.sign_up({email, password, options.data.nickname})` 를 호출하면
+        Supabase 가 `auth.users` 에 행을 만들고, `raw_user_meta_data` 에
+        `{"nickname": ...}` 을 저장한다.
+      * `auth.users` INSERT 직후 트리거 `handle_new_user` (SECURITY DEFINER)
+        가 자동으로 `public.profiles(id, nickname)` 을 INSERT 한다. RLS 가
+        strict (`auth.uid() = id`) 여도 트리거가 시스템 권한으로 우회한다.
+      * 따라서 클라이언트에서 별도의 `profiles.upsert` 가 필요 없다 — 트리거가
+        단일 책임을 갖는다. 닉네임 변경은 `update_user_nickname` 으로 추후
+        독립적으로 처리.
+
+    [중복 가입 처리]
+      * supabase-py v2 는 이미 존재하는 이메일에 대해 예외를 던지지 않는다.
+        응답은 받지만 `session=None`, `identities==[]` 시그니처. 이걸로
+        'duplicate' vs 'fresh signup' 을 구분한다.
     """
     if not email or not password:
         return "❌ 이메일과 비밀번호를 입력하세요."
@@ -672,8 +708,21 @@ def sign_up_user(email: str, password: str, nickname: str) -> str:
     except Exception as e:
         return f"❌ Auth 클라이언트 확보 실패: {e}"
 
+    # 사용자가 빈 닉네임을 제출했어도 이메일 prefix 로 채워 트리거에 전달한다.
+    # 트리거의 COALESCE 가 추가로 'user_<8>' fallback 을 가지지만, 이메일
+    # prefix 가 식별성이 더 좋다.
+    chosen_nick = (nickname or "").strip() or email.split("@")[0]
+
     try:
-        res = auth.sign_up({"email": email, "password": password})
+        res = auth.sign_up(
+            {
+                "email": email,
+                "password": password,
+                # raw_user_meta_data 에 들어가서 트리거 `handle_new_user` 가 읽음.
+                # 이 값으로 `profiles.nickname` 이 자동 세팅된다.
+                "options": {"data": {"nickname": chosen_nick}},
+            }
+        )
     except Exception as e:
         return (
             f"❌ Supabase sign_up 호출 실패\n"
@@ -686,12 +735,7 @@ def sign_up_user(email: str, password: str, nickname: str) -> str:
     session = getattr(res, "session", None)
     identities = getattr(user_obj, "identities", None) if user_obj else None
 
-    # ──────────────────────────────────────────────────────────────
-    # supabase-py v2 의 "duplicate email" 시그널:
-    #   session=None  AND  (identities 비었거나 user_obj 만 채워짐)
-    # 이메일 확인이 켜진 프로젝트에서 '새 가입' 도 session=None 이지만
-    # identities 는 비어 있지 않다.
-    # ──────────────────────────────────────────────────────────────
+    # supabase-py v2 의 'duplicate email' 시그니처
     if user_id and session is None and (identities == [] or identities is None):
         return (
             "⚠️ 이미 가입된 이메일입니다. 로그인 탭으로 진행하세요.\n"
@@ -701,7 +745,6 @@ def sign_up_user(email: str, password: str, nickname: str) -> str:
         )
 
     if not user_id:
-        # 응답은 받았으나 user.id 가 비어 있는 경우 — 진단 메타데이터로 안내
         bits = []
         if hasattr(res, "session"):
             bits.append(f"session={bool(session)}")
@@ -714,36 +757,19 @@ def sign_up_user(email: str, password: str, nickname: str) -> str:
             f"이메일 확인 정책을 확인하세요."
         )
 
-    chosen_nick = (nickname or "").strip() or email.split("@")[0]
-    profile_err: str | None = None
-    profile_rls_blocked = False
-    try:
-        conn.table("profiles").upsert(
-            {"id": user_id, "nickname": chosen_nick}
-        ).execute()
-    except Exception as e:
-        profile_err = f"{type(e).__name__}: {e}"
-        profile_rls_blocked = _is_rls_error(e)
-
-    msg = (
-        f"✅ auth.users 가입 완료!\n"
+    # auth.users INSERT 가 끝났으므로 트리거 `handle_new_user` 가 이미
+    # profiles 행을 만들었어야 한다. 별도의 클라이언트 INSERT/UPSERT 는 하지
+    # 않는다. (트리거 미적용 환경이라면 update_user_nickname 시점에 42501 이
+    # 떨어지고 그때 _rls_guidance 가 본 PR 의 표준 SQL 을 안내해 준다.)
+    return (
+        f"✅ 가입 완료!\n"
         f"- user_id: `{user_id[:8]}…{user_id[-4:]}` (전체는 Supabase 에서 확인)\n"
         f"- 프로젝트: …{url_suffix}\n"
-        f"- 확인 경로: **Supabase Dashboard → Authentication → Users**\n"
-        f"  (`public.profiles` 는 닉네임만; `auth.users` 가 마스터)"
+        f"- `auth.users` + `public.profiles` 양쪽 모두 생성됨\n"
+        f"  (트리거 `handle_new_user` 가 profiles 행을 자동 생성)\n"
+        f"- 닉네임: `{chosen_nick}` — 추후 '설정' 모달에서 변경 가능\n"
+        f"- 확인 경로: **Supabase Dashboard → Authentication → Users**"
     )
-    if profile_rls_blocked:
-        msg += "\n\n" + _rls_guidance("profiles")
-        msg += (
-            "\n\n(닉네임은 SQL 적용 후 '설정' 모달에서 다시 저장하면 됩니다. "
-            "auth 가입 자체는 이미 완료됨.)"
-        )
-    elif profile_err:
-        msg += (
-            f"\n\n⚠️ profiles 행 생성 실패 (auth 가입은 성공):\n- {profile_err}\n"
-            "- 트리거로 자동 생성되는 환경이면 무시 가능."
-        )
-    return msg
 
 
 def sign_in_user(email: str, password: str) -> str:
