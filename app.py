@@ -505,6 +505,20 @@ def _resolve_auth():
     return auth
 
 
+def _supabase_url_suffix(n: int = 18) -> str:
+    """진단 메시지에 노출할 Supabase 프로젝트 URL 의 짧은 식별자.
+
+    예: `https://abcdefghijkl.supabase.co` → `...lmnop.supabase.co`
+    잘못된 프로젝트에 가입되고 있는지 사용자가 빠르게 검증 가능하도록 한다.
+    전체 URL 은 노출하지 않는다 (시연 영상에 노출되더라도 안전).
+    """
+    try:
+        url = s_url or ""
+        return url[-n:] if url else "?"
+    except Exception:
+        return "?"
+
+
 def sign_up_user(email: str, password: str, nickname: str) -> str:
     """이메일 + 비밀번호 회원가입 후 `profiles` 행 생성.
 
@@ -513,35 +527,75 @@ def sign_up_user(email: str, password: str, nickname: str) -> str:
         프로젝트 설정에 따름; 확인 필요 시 메일함 안내 메시지를 반환).
       * 성공 시 `profiles(id, nickname)` 을 UPSERT. 트리거로 자동 생성되는
         프로젝트라도 nickname 만 덮어쓰므로 충돌이 없다.
+
+    [진단 메시지]
+      * 사용자가 시연 중 "회원가입 했는데 DB 에 안 보인다" 라고 자주 헷갈리는
+        지점이 두 가지:
+          (i) `auth.users` 가 아니라 `public.profiles` 만 보고 있음
+          (ii) 다른 Supabase 프로젝트에 가입되고 있음 (URL/Key 불일치)
+        둘 다 진단할 수 있도록 성공 메시지에 `user_id` + URL suffix + 어디서
+        확인하라는 안내를 함께 포함한다.
     """
     if not email or not password:
         return "❌ 이메일과 비밀번호를 입력하세요."
     if len(password) < 6:
         return "❌ 비밀번호는 6자 이상이어야 합니다."
+
+    url_suffix = _supabase_url_suffix()
+
     try:
         auth = _resolve_auth()
+    except Exception as e:
+        return f"❌ Auth 클라이언트 확보 실패: {e}"
+
+    try:
         res = auth.sign_up({"email": email, "password": password})
     except Exception as e:
-        return f"❌ 가입 실패: {e}"
+        return (
+            f"❌ Supabase sign_up 호출 실패\n"
+            f"- 프로젝트: …{url_suffix}\n"
+            f"- {type(e).__name__}: {e}"
+        )
 
     user_obj = getattr(res, "user", None)
     user_id = getattr(user_obj, "id", None) if user_obj else None
     if not user_id:
+        # 응답은 받았으나 user.id 가 비어 있는 경우 — 진단 메타데이터로 안내
+        bits = []
+        if hasattr(res, "session"):
+            bits.append(f"session={bool(getattr(res, 'session', None))}")
+        if hasattr(res, "user"):
+            bits.append(f"user={bool(getattr(res, 'user', None))}")
         return (
-            "⚠️ 가입은 시도되었으나 사용자 정보를 받지 못했습니다. "
-            "이메일 확인이 필요한 프로젝트일 수 있으니 메일함을 확인하세요."
+            f"⚠️ 가입 응답에 user.id 가 없습니다 ({', '.join(bits) or 'no diag'}).\n"
+            f"- 프로젝트: …{url_suffix}\n"
+            f"- Supabase Dashboard → Authentication → Settings 에서 "
+            f"이메일 확인 정책을 확인하세요."
         )
 
     chosen_nick = (nickname or "").strip() or email.split("@")[0]
+    profile_err: str | None = None
     try:
         conn.table("profiles").upsert(
             {"id": user_id, "nickname": chosen_nick}
         ).execute()
-    except Exception:
-        # profiles 가 트리거로 자동 생성되는 환경에서는 무시 가능
-        pass
+    except Exception as e:
+        profile_err = f"{type(e).__name__}: {e}"
 
-    return "✅ 회원가입 성공! (확인 메일이 필요한 프로젝트면 메일함을 확인하세요)"
+    msg = (
+        f"✅ 회원가입 성공!\n"
+        f"- user_id: `{user_id[:8]}…{user_id[-4:]}` (전체는 Supabase 에서 확인)\n"
+        f"- 프로젝트: …{url_suffix}\n"
+        f"- 확인 경로: **Supabase Dashboard → Authentication → Users** "
+        f"(public.profiles 는 닉네임만; auth.users 가 마스터)"
+    )
+    if profile_err:
+        msg += (
+            f"\n⚠️ profiles 행 생성은 실패했지만 auth.users 가입은 완료됨\n"
+            f"- {profile_err}\n"
+            f"- 트리거로 자동 생성되는 환경이면 무시 가능."
+        )
+    return msg
 
 
 def sign_in_user(email: str, password: str) -> str:
@@ -992,6 +1046,9 @@ def _render_auth_panel() -> None:
             )
         if submitted_up:
             msg = sign_up_user(up_email, up_pwd, up_nick)
+            # 다중 라인 + 마크다운 가독성 보장: success/warning/error 헬퍼는
+            # 마크다운을 지원하지만 narrow sidebar 에서는 info 박스 모양이
+            # 더 안정적으로 줄바꿈된다.
             if msg.startswith("✅"):
                 st.success(msg)
             elif msg.startswith("⚠️"):
