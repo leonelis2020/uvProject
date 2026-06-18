@@ -503,8 +503,114 @@ BUCKET_RESULTS = "results"
 
 
 def ensure_authenticated() -> dict | None:
-    """Supabase Auth 세션 체크."""
+    """Supabase Auth 세션 체크 — `sign_in_user` 가 채워준 `SS_AUTH_USER` 를 반환."""
     return st.session_state.get(SS_AUTH_USER)
+
+
+def _resolve_auth():
+    """`st_supabase_connection` 내부의 supabase-py Auth 클라이언트 추출.
+
+    `_resolve_storage` 와 동일한 방어적 탐색 패턴.
+    """
+    for attr in ("client", "_client", "session", "supabase_client"):
+        candidate = getattr(conn, attr, None)
+        auth = getattr(candidate, "auth", None) if candidate is not None else None
+        if auth is not None:
+            return auth
+    auth = getattr(conn, "auth", None)
+    if auth is None:
+        raise RuntimeError(
+            "Supabase Auth 클라이언트를 찾을 수 없습니다. "
+            "st_supabase_connection 버전을 확인하세요."
+        )
+    return auth
+
+
+def sign_up_user(email: str, password: str, nickname: str) -> str:
+    """이메일 + 비밀번호 회원가입 후 `profiles` 행 생성.
+
+    [규칙]
+      * `auth.sign_up()` → 새 `auth.users` row 생성 (이메일 확인 정책은 Supabase
+        프로젝트 설정에 따름; 확인 필요 시 메일함 안내 메시지를 반환).
+      * 성공 시 `profiles(id, nickname)` 을 UPSERT. 트리거로 자동 생성되는
+        프로젝트라도 nickname 만 덮어쓰므로 충돌이 없다.
+    """
+    if not email or not password:
+        return "❌ 이메일과 비밀번호를 입력하세요."
+    if len(password) < 6:
+        return "❌ 비밀번호는 6자 이상이어야 합니다."
+    try:
+        auth = _resolve_auth()
+        res = auth.sign_up({"email": email, "password": password})
+    except Exception as e:
+        return f"❌ 가입 실패: {e}"
+
+    user_obj = getattr(res, "user", None)
+    user_id = getattr(user_obj, "id", None) if user_obj else None
+    if not user_id:
+        return (
+            "⚠️ 가입은 시도되었으나 사용자 정보를 받지 못했습니다. "
+            "이메일 확인이 필요한 프로젝트일 수 있으니 메일함을 확인하세요."
+        )
+
+    chosen_nick = (nickname or "").strip() or email.split("@")[0]
+    try:
+        conn.table("profiles").upsert(
+            {"id": user_id, "nickname": chosen_nick}
+        ).execute()
+    except Exception:
+        # profiles 가 트리거로 자동 생성되는 환경에서는 무시 가능
+        pass
+
+    return "✅ 회원가입 성공! (확인 메일이 필요한 프로젝트면 메일함을 확인하세요)"
+
+
+def sign_in_user(email: str, password: str) -> str:
+    """이메일 + 비밀번호 로그인 — `SS_AUTH_USER` 에 user 컨텍스트 저장."""
+    if not email or not password:
+        return "❌ 이메일과 비밀번호를 입력하세요."
+    try:
+        auth = _resolve_auth()
+        res = auth.sign_in_with_password({"email": email, "password": password})
+    except Exception as e:
+        return f"❌ 로그인 실패: {e}"
+
+    user_obj = getattr(res, "user", None)
+    user_id = getattr(user_obj, "id", None) if user_obj else None
+    if not user_id:
+        return "❌ 로그인 실패: 사용자 정보를 받지 못했습니다."
+
+    # 닉네임 조회 — profiles 에 없으면 이메일 prefix 로 fallback
+    nickname: str | None = None
+    try:
+        prof = (
+            conn.table("profiles")
+            .select("nickname")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if prof.data:
+            nickname = prof.data[0].get("nickname")
+    except Exception:
+        pass
+
+    st.session_state[SS_AUTH_USER] = {
+        "id": user_id,
+        "email": getattr(user_obj, "email", email),
+        "nickname": nickname or email.split("@")[0],
+    }
+    return "✅ 로그인 완료"
+
+
+def sign_out_user() -> None:
+    """Supabase Auth 세션 종료 + `SS_AUTH_USER` 초기화."""
+    try:
+        auth = _resolve_auth()
+        auth.sign_out()
+    except Exception:
+        pass
+    st.session_state.pop(SS_AUTH_USER, None)
 
 
 def _resolve_storage():
@@ -789,35 +895,84 @@ def request_project_deletion(project_id: str, created_at_iso: str, scrap_count: 
 # UI COMPONENTS
 # =============================================================================
 
-# ---------- 좌측 사이드바: 프로필 + 라인업 ---------------------------------------
+# ---------- 좌측 사이드바: 인증 + 라인업 ----------------------------------------
 def render_sidebar() -> None:
-    """좌측: 프로필 + '내가 공유한' / '남이 공유한' 미리보기 라인업.
+    """좌측: 인증 패널 + '내가 공유한' / '남이 공유한' 미리보기 라인업.
 
-    프로필 이미지는 현재 보류(요구사항). 닉네임 + UID 만 노출.
+    프로필 이미지는 보류(요구사항). 닉네임 + UID 만 노출.
     """
-    user = ensure_authenticated() or {}
     with st.sidebar:
-        col_a, col_b = st.columns([3, 1])
-        with col_a:
-            st.markdown(f"**{user.get('nickname') or 'user_nickname'}**")
-            st.caption(f"@{(user.get('id') or 'user_UID')[:8]}")
-        with col_b:
-            st.button("⚙️", key="open_settings", help="설정")
-
+        _render_auth_panel()
         st.divider()
 
-        st.caption("내가 공유한 미리보기")
-        _render_lineup(
-            fetch_my_shared_projects(user.get("id"), limit=10),
-            key_prefix="mine",
-        )
+        user = ensure_authenticated()
+        if user:
+            st.caption("내가 공유한 미리보기")
+            _render_lineup(
+                fetch_my_shared_projects(user.get("id"), limit=10),
+                key_prefix="mine",
+            )
+            st.divider()
 
-        st.divider()
         st.caption("내가 공유받은(남이 공유한) 미리보기")
         _render_lineup(
-            fetch_others_shared_projects(user.get("id"), limit=10),
+            fetch_others_shared_projects((user or {}).get("id"), limit=10),
             key_prefix="others",
         )
+
+
+def _render_auth_panel() -> None:
+    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + 로그아웃 (인증)."""
+    user = ensure_authenticated()
+    if user:
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            st.markdown(f"**{user.get('nickname') or user.get('email') or 'user'}**")
+            uid_short = (user.get("id") or "")[:8]
+            st.caption(f"@{uid_short or 'user_UID'}")
+        with col_b:
+            if st.button("⎋", key="signout_btn", help="로그아웃", use_container_width=True):
+                sign_out_user()
+                st.rerun()
+        return
+
+    # ── 비로그인 상태 — 인라인 폼 ──────────────────────────────────────────
+    st.markdown("**🔐 로그인 / 회원가입**")
+    tab_in, tab_up = st.tabs(["로그인", "회원가입"])
+
+    with tab_in:
+        with st.form("signin_form", clear_on_submit=False):
+            in_email = st.text_input("이메일", key="signin_email")
+            in_pwd = st.text_input("비밀번호", type="password", key="signin_pwd")
+            submitted_in = st.form_submit_button(
+                "로그인", use_container_width=True, type="primary"
+            )
+        if submitted_in:
+            msg = sign_in_user(in_email, in_pwd)
+            if msg.startswith("✅"):
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    with tab_up:
+        with st.form("signup_form", clear_on_submit=False):
+            up_email = st.text_input("이메일", key="signup_email")
+            up_pwd = st.text_input(
+                "비밀번호 (6자 이상)", type="password", key="signup_pwd"
+            )
+            up_nick = st.text_input("닉네임 (선택)", key="signup_nick")
+            submitted_up = st.form_submit_button(
+                "가입", use_container_width=True
+            )
+        if submitted_up:
+            msg = sign_up_user(up_email, up_pwd, up_nick)
+            if msg.startswith("✅"):
+                st.success(msg)
+            elif msg.startswith("⚠️"):
+                st.warning(msg)
+            else:
+                st.error(msg)
 
 
 def _render_lineup(items: list[dict], key_prefix: str) -> None:
