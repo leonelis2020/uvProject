@@ -519,22 +519,47 @@ def _supabase_url_suffix(n: int = 18) -> str:
         return "?"
 
 
+_PROFILES_RLS_SQL = (
+    "ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;\n"
+    "CREATE POLICY \"profiles_insert_all\" ON public.profiles "
+    "FOR INSERT WITH CHECK (true);\n"
+    "CREATE POLICY \"profiles_update_all\" ON public.profiles "
+    "FOR UPDATE USING (true);\n"
+    "CREATE POLICY \"profiles_select_all\" ON public.profiles "
+    "FOR SELECT USING (true);"
+)
+
+
+def _is_rls_error(err: Exception | str) -> bool:
+    """Postgres 42501 (insufficient_privilege) / RLS 위반 메시지인지 판별."""
+    s = str(err)
+    return (
+        "42501" in s
+        or "row-level security" in s.lower()
+        or "violates row-level security policy" in s.lower()
+    )
+
+
+def _rls_guidance(table: str) -> str:
+    """RLS 차단 시 사용자에게 어디에 무슨 SQL 을 붙여넣을지 안내."""
+    return (
+        f"🔒 Postgres RLS 가 `public.{table}` 의 쓰기를 막고 있습니다.\n"
+        f"Supabase Dashboard → SQL Editor 에 아래를 붙여넣고 실행해 주세요"
+        f"(기존 projects/palettes 와 같은 'open for testing' 정책):\n\n"
+        f"```sql\n{_PROFILES_RLS_SQL}\n```"
+    )
+
+
 def sign_up_user(email: str, password: str, nickname: str) -> str:
     """이메일 + 비밀번호 회원가입 후 `profiles` 행 생성.
 
-    [규칙]
-      * `auth.sign_up()` → 새 `auth.users` row 생성 (이메일 확인 정책은 Supabase
-        프로젝트 설정에 따름; 확인 필요 시 메일함 안내 메시지를 반환).
-      * 성공 시 `profiles(id, nickname)` 을 UPSERT. 트리거로 자동 생성되는
-        프로젝트라도 nickname 만 덮어쓰므로 충돌이 없다.
-
-    [진단 메시지]
-      * 사용자가 시연 중 "회원가입 했는데 DB 에 안 보인다" 라고 자주 헷갈리는
-        지점이 두 가지:
-          (i) `auth.users` 가 아니라 `public.profiles` 만 보고 있음
-          (ii) 다른 Supabase 프로젝트에 가입되고 있음 (URL/Key 불일치)
-        둘 다 진단할 수 있도록 성공 메시지에 `user_id` + URL suffix + 어디서
-        확인하라는 안내를 함께 포함한다.
+    [핵심 동작]
+      * `auth.sign_up()` → `auth.users` row 생성/조회. supabase-py v2 는 이미
+        존재하는 이메일에 대해 **예외를 던지지 않는다** — 응답은 받지만
+        `res.session = None` 이고 종종 `user_obj.identities == []` 가 된다.
+        이 두 시그널로 'duplicate' vs 'fresh signup' 을 구분한다.
+      * 새 가입이면 `profiles(id, nickname)` 을 UPSERT (RLS 차단 시
+        명시적 SQL 안내 반환).
     """
     if not email or not password:
         return "❌ 이메일과 비밀번호를 입력하세요."
@@ -559,13 +584,30 @@ def sign_up_user(email: str, password: str, nickname: str) -> str:
 
     user_obj = getattr(res, "user", None)
     user_id = getattr(user_obj, "id", None) if user_obj else None
+    session = getattr(res, "session", None)
+    identities = getattr(user_obj, "identities", None) if user_obj else None
+
+    # ──────────────────────────────────────────────────────────────
+    # supabase-py v2 의 "duplicate email" 시그널:
+    #   session=None  AND  (identities 비었거나 user_obj 만 채워짐)
+    # 이메일 확인이 켜진 프로젝트에서 '새 가입' 도 session=None 이지만
+    # identities 는 비어 있지 않다.
+    # ──────────────────────────────────────────────────────────────
+    if user_id and session is None and (identities == [] or identities is None):
+        return (
+            "⚠️ 이미 가입된 이메일입니다. 로그인 탭으로 진행하세요.\n"
+            f"- 프로젝트: …{url_suffix}\n"
+            "- 비밀번호를 잊었다면 Supabase Dashboard → Authentication → Users "
+            "에서 비밀번호 재설정 메일을 발송하거나 사용자를 삭제 후 재가입하세요."
+        )
+
     if not user_id:
         # 응답은 받았으나 user.id 가 비어 있는 경우 — 진단 메타데이터로 안내
         bits = []
         if hasattr(res, "session"):
-            bits.append(f"session={bool(getattr(res, 'session', None))}")
+            bits.append(f"session={bool(session)}")
         if hasattr(res, "user"):
-            bits.append(f"user={bool(getattr(res, 'user', None))}")
+            bits.append(f"user={bool(user_obj)}")
         return (
             f"⚠️ 가입 응답에 user.id 가 없습니다 ({', '.join(bits) or 'no diag'}).\n"
             f"- 프로젝트: …{url_suffix}\n"
@@ -575,25 +617,32 @@ def sign_up_user(email: str, password: str, nickname: str) -> str:
 
     chosen_nick = (nickname or "").strip() or email.split("@")[0]
     profile_err: str | None = None
+    profile_rls_blocked = False
     try:
         conn.table("profiles").upsert(
             {"id": user_id, "nickname": chosen_nick}
         ).execute()
     except Exception as e:
         profile_err = f"{type(e).__name__}: {e}"
+        profile_rls_blocked = _is_rls_error(e)
 
     msg = (
-        f"✅ 회원가입 성공!\n"
+        f"✅ auth.users 가입 완료!\n"
         f"- user_id: `{user_id[:8]}…{user_id[-4:]}` (전체는 Supabase 에서 확인)\n"
         f"- 프로젝트: …{url_suffix}\n"
-        f"- 확인 경로: **Supabase Dashboard → Authentication → Users** "
-        f"(public.profiles 는 닉네임만; auth.users 가 마스터)"
+        f"- 확인 경로: **Supabase Dashboard → Authentication → Users**\n"
+        f"  (`public.profiles` 는 닉네임만; `auth.users` 가 마스터)"
     )
-    if profile_err:
+    if profile_rls_blocked:
+        msg += "\n\n" + _rls_guidance("profiles")
         msg += (
-            f"\n⚠️ profiles 행 생성은 실패했지만 auth.users 가입은 완료됨\n"
-            f"- {profile_err}\n"
-            f"- 트리거로 자동 생성되는 환경이면 무시 가능."
+            "\n\n(닉네임은 SQL 적용 후 '설정' 모달에서 다시 저장하면 됩니다. "
+            "auth 가입 자체는 이미 완료됨.)"
+        )
+    elif profile_err:
+        msg += (
+            f"\n\n⚠️ profiles 행 생성 실패 (auth 가입은 성공):\n- {profile_err}\n"
+            "- 트리거로 자동 생성되는 환경이면 무시 가능."
         )
     return msg
 
@@ -651,12 +700,19 @@ def update_user_nickname(user_id: str, new_nickname: str) -> str:
 
     Caller (`show_settings_modal`) 가 성공 시 `SS_AUTH_USER.nickname` 도
     같이 갱신해서 사이드바가 즉시 새 닉네임으로 보이게 한다.
+
+    [에러 처리]
+      * Postgres 42501 (RLS) → `_rls_guidance("profiles")` 로 사용자가 붙여넣을
+        SQL 을 그대로 메시지에 첨부. 시연 중 막혀 있던 가장 흔한 케이스.
+      * UPDATE 가 0건이면 UPSERT 로 폴백 (트리거가 없어 profiles 행이 아직
+        없는 사용자도 닉네임을 설정할 수 있게).
     """
     cleaned = (new_nickname or "").strip()
     if not cleaned:
         return "❌ 닉네임은 비어 있을 수 없습니다."
     if len(cleaned) > 50:
         return "❌ 닉네임은 50자 이내로 입력하세요."
+
     try:
         resp = (
             conn.table("profiles")
@@ -665,7 +721,9 @@ def update_user_nickname(user_id: str, new_nickname: str) -> str:
             .execute()
         )
     except Exception as e:
-        return f"❌ 닉네임 변경 실패: {e}"
+        if _is_rls_error(e):
+            return "❌ 닉네임 변경 실패 (RLS 차단)\n\n" + _rls_guidance("profiles")
+        return f"❌ 닉네임 변경 실패: {type(e).__name__}: {e}"
 
     # 일부 환경에서는 profiles 행이 아직 없어 UPDATE 가 0건일 수 있음 — UPSERT 폴백
     if not getattr(resp, "data", None):
@@ -674,7 +732,12 @@ def update_user_nickname(user_id: str, new_nickname: str) -> str:
                 {"id": user_id, "nickname": cleaned}
             ).execute()
         except Exception as e:
-            return f"❌ profiles 행이 없어 UPSERT 도 실패: {e}"
+            if _is_rls_error(e):
+                return (
+                    "❌ profiles 행이 없고 UPSERT 도 RLS 가 막았습니다.\n\n"
+                    + _rls_guidance("profiles")
+                )
+            return f"❌ profiles 행이 없어 UPSERT 도 실패: {type(e).__name__}: {e}"
 
     return f"✅ 닉네임이 '{cleaned}' 으로 변경되었습니다."
 
@@ -988,31 +1051,36 @@ def render_sidebar() -> None:
 
 
 def _render_auth_panel() -> None:
-    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + ⚙️ + ⎋ (인증)."""
+    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + 설정 + 로그아웃 (인증).
+
+    아이콘(⚙️ / ⎋) 만 사용했을 때 일부 환경의 emoji 폰트가 fallback 정사각형으로
+    렌더되어 가독성이 떨어졌다. 텍스트 라벨 + 단순 ASCII 마커를 함께 사용해
+    OS/브라우저 무관하게 안정적으로 보이게 한다.
+    """
     user = ensure_authenticated()
     if user:
-        col_a, col_b, col_c = st.columns([4, 1, 1])
-        with col_a:
-            st.markdown(f"**{user.get('nickname') or user.get('email') or 'user'}**")
-            uid_short = (user.get("id") or "")[:8]
-            st.caption(f"@{uid_short or 'user_UID'}")
-        with col_b:
-            if st.button(
-                "⚙️",
-                key="settings_btn",
-                help="설정 (닉네임 변경)",
-                use_container_width=True,
-            ):
-                show_settings_modal()
-        with col_c:
-            if st.button(
-                "⎋",
-                key="signout_btn",
-                help="로그아웃",
-                use_container_width=True,
-            ):
-                sign_out_user()
-                st.rerun()
+        # 1행: 닉네임 + UID
+        st.markdown(f"**{user.get('nickname') or user.get('email') or 'user'}**")
+        uid_short = (user.get("id") or "")[:8]
+        st.caption(f"@{uid_short or 'user_UID'}")
+
+        # 2행: 두 개의 동일 너비 텍스트 버튼 — 어떤 환경에서도 깔끔하게 보임
+        col_a, col_b = st.columns(2)
+        if col_a.button(
+            "설정",
+            key="settings_btn",
+            help="닉네임 변경 / DB 진단",
+            use_container_width=True,
+        ):
+            show_settings_modal()
+        if col_b.button(
+            "로그아웃",
+            key="signout_btn",
+            help="현재 세션 종료",
+            use_container_width=True,
+        ):
+            sign_out_user()
+            st.rerun()
         return
 
     # ── 비로그인 상태 — 인라인 폼 ──────────────────────────────────────────
