@@ -3,18 +3,20 @@ UV 모사 팔레트 연구실 (UV Simulation Palette Lab)
 ==================================================
 Fat-Client (Streamlit) + Thin-DB (Supabase) 스카폴딩.
 
-설계 원칙
----------
+설계 원칙 (v2 — UI 개편 + GPT-4o-mini 전환 반영)
+---------------------------------------------------
 * 5x10 명채도 매트릭스 타일과 같은 휘발성/연산 집약적 데이터는 DB에 저장하지 않고,
   프론트엔드(Streamlit)에서 실시간 연산한다. DB는 `matrix_json`(3x4) + 대표 색상
   `base_colors`(5 HEX)만 보관한다.
-* RAG (Retrieval Augmented Generation) 컨텍스트는 `standard_illuminants`와
-  `reflectance_library` 두 마스터 테이블에서 조회하여 GPT-4o 프롬프트에 결합한다.
+* RAG 컨텍스트는 `standard_illuminants.spd_data` 와 `reflectance_library.spectral_values`
+  두 마스터 테이블에서 조회한다. **GPT-4o-mini 호출 시 이미지는 전달하지 않으며**
+  오직 분광/SPD JSON 만 보낸다 (토큰 절약 + 환각 방지).
 * 모든 사용자 산출물(`projects`)은 덮어쓰지 않고 `parent_id` 셀프 참조 스냅샷을 통해
-  버전 히스토리를 유지한다. 스크랩(reuse) 역시 `parent_id`로 부모 프로젝트를 가리킨다.
+  버전 히스토리를 유지한다. 스크랩(reuse)은 익명 카운트(`scrap_count`) 만 누적한다.
+* 50칸 팔레트는 OKLCH 색공간에서 명도(L) 만 변주하여 클라이언트에서 재계산한다.
 
 이 파일은 "큰 틀(Scaffolding)"이며, 각 단계(PHASE 1~5)는 향후 세부 알고리즘
-(OpenCV 변환, drawable-canvas 마스킹, GPT-4o 멀티모달 호출 등)이 살을 붙일 수
+(OpenCV 변환, drawable-canvas 마스킹, GPT-4o-mini 호출 등)이 살을 붙일 수
 있도록 추상화된 함수와 명확히 구분된 섹션 주석으로 정리되어 있다.
 """
 
@@ -35,8 +37,6 @@ from st_supabase_connection import SupabaseConnection
 #   - `standard_illuminants`, `reflectance_library` 마스터 데이터 접근 헬퍼
 # =============================================================================
 
-# 1. Supabase 연결 설정 (secrets.toml 필요)
-# 파일이 아니라 시스템(코드스페이스) 환경 변수에서 우선 가져옴
 s_url = os.environ.get("SUPABASE_URL")
 s_key = os.environ.get("SUPABASE_KEY")
 
@@ -60,11 +60,7 @@ conn = st.connection(
 # 마스터 데이터 헬퍼 (RAG context loaders)
 # -----------------------------------------------------------------------------
 def get_reflectance_data(label: str) -> list[dict] | None:
-    """RAG용 반사율 라이브러리 조회.
-
-    기존 시그니처를 그대로 유지한다. 향후 `category` 필터, `is_uv_active` 토글,
-    파장 범위 슬라이싱 등을 인자로 받아 확장될 수 있다.
-    """
+    """RAG용 반사율 라이브러리 조회 (기존 시그니처 보호)."""
     query = (
         conn.table("reflectance_library")
         .select("*")
@@ -75,107 +71,123 @@ def get_reflectance_data(label: str) -> list[dict] | None:
 
 
 def get_illuminant_spd(name: str) -> dict | None:
-    """광원(`standard_illuminants`) SPD(분광 전력 분포) 조회.
+    """광원(`standard_illuminants`) SPD(분광 전력 분포) 단일 조회."""
+    try:
+        query = (
+            conn.table("standard_illuminants")
+            .select("*")
+            .eq("name", name)
+            .single()
+            .execute()
+        )
+        return query.data if getattr(query, "data", None) else None
+    except Exception:
+        return None
 
-    GPT-4o 프롬프트 합성 시 `reflectance_library.spectral_values`와 곱해
-    조명 가중 색상을 추정하는 데 사용된다.
-    """
-    query = (
-        conn.table("standard_illuminants")
-        .select("*")
-        .eq("name", name)
-        .single()
-        .execute()
-    )
-    return query.data if getattr(query, "data", None) else None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def list_subjects() -> list[dict]:
+    """피사체 50종 전체 목록 (중앙 태그 탭에서 사용)."""
+    try:
+        resp = (
+            conn.table("reflectance_library")
+            .select("id, category, label, is_uv_active")
+            .order("category")
+            .order("label")
+            .execute()
+        )
+        return resp.data or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def list_illuminants() -> list[dict]:
+    """광원 5종 전체 목록."""
+    try:
+        resp = (
+            conn.table("standard_illuminants")
+            .select("id, name, description")
+            .order("name")
+            .execute()
+        )
+        return resp.data or []
+    except Exception:
+        return []
 
 
 # =============================================================================
-# PHASE 1: INPUT  —  이미지 업로드 / 리사이즈 / 마스킹
-#   - PIL.Image.thumbnail((1024, 1024)) 1024px 리사이즈
-#   - streamlit-drawable-canvas 마스크 UI 슬롯
-#   - 결과는 st.session_state 에 저장하여 PHASE 2 가 소비한다.
-# =============================================================================
-
 # session_state 키 표준 (모듈 간 계약)
-SS_ORIGIN_IMAGE = "origin_image_pil"     # PIL.Image — 1024px 리사이즈 본
-SS_ORIGIN_BYTES = "origin_image_bytes"   # bytes — Storage 업로드용 원본
-SS_MASK_ARRAY = "mask_array"             # np.ndarray — drawable-canvas 결과
-SS_MATRIX = "matrix_json"                # dict — GPT-4o 가 반환한 3x4 매트릭스
-SS_BASE_COLORS = "base_colors"           # list[str] — HEX 5개
-SS_TILE_GRID = "tile_grid_5x10"          # list[list[str]] — 휘발성, DB 미저장
-SS_IS_ANON = "is_anon"                   # bool — 익명 공유 토글
-SS_AUTH_USER = "auth_user"               # dict | None — Supabase Auth user
+# =============================================================================
+SS_ORIGIN_IMAGE = "origin_image_pil"        # PIL.Image — 1024px 리사이즈 본
+SS_ORIGIN_BYTES = "origin_image_bytes"      # bytes — Storage 업로드용 원본
+SS_RESULT_BYTES = "result_image_bytes"      # bytes — 변환 결과
+SS_MATRIX = "matrix_json"                   # dict — GPT-4o-mini 가 반환한 3x4 매트릭스
+SS_BASE_COLORS = "base_colors"              # list[str] — HEX 5개
+SS_TILE_GRID = "tile_grid_5x10"             # list[list[str]] — 휘발성, DB 미저장
+SS_IS_ANON = "is_anon"                      # bool — 익명 닉네임 (is_anonymous)
+SS_IS_PALETTE_PUBLIC = "is_palette_public"  # bool — 팔레트 공개 여부
+SS_AUTH_USER = "auth_user"                  # dict | None — Supabase Auth user
+SS_SELECTED_SUBJECT = "selected_subject"    # dict | None — reflectance_library row
+SS_SELECTED_ILLU = "selected_illu"          # dict | None — standard_illuminants row
 
+
+# =============================================================================
+# PHASE 1: INPUT  —  이미지 업로드 / 리사이즈
+#   - PIL.Image.thumbnail((1024, 1024)) 1024px 리사이즈
+#   - 결과는 st.session_state 에 저장하여 PHASE 3 가 소비한다.
+#   (drawable-canvas 마스킹은 현재 UI 안에는 노출되지 않으며 향후 옵션 슬롯으로 유지)
+# =============================================================================
 
 def handle_image_upload(uploaded_file) -> None:
     """업로드 파일을 1024px 썸네일로 리사이즈하고 session_state 에 저장.
 
     NOTE (PHASE 1 확장 지점):
-      * 향후 EXIF 회전 보정, sRGB 프로파일 강제 변환, HEIC 디코딩 등은
-        본 함수 내부에서 처리하라.
-      * 결과물의 메타데이터(width, height, channels)도 session_state 에
-        함께 저장하여 PHASE 2 의 프롬프트 토큰 절약 로직에 활용 가능.
+      * `from PIL import Image, ImageOps`
+      * `img = ImageOps.exif_transpose(Image.open(uploaded_file).convert("RGB"))`
+      * `img.thumbnail((1024, 1024))`
+      * `buf = io.BytesIO(); img.save(buf, "PNG")`
+      * `st.session_state[SS_ORIGIN_IMAGE] = img`
+      * `st.session_state[SS_ORIGIN_BYTES] = buf.getvalue()`
     """
-    # TODO[PHASE-1]: from PIL import Image; img = Image.open(uploaded_file)
-    # TODO[PHASE-1]: img.thumbnail((1024, 1024)); buf = io.BytesIO(); img.save(buf, "PNG")
-    # TODO[PHASE-1]: st.session_state[SS_ORIGIN_IMAGE] = img
-    # TODO[PHASE-1]: st.session_state[SS_ORIGIN_BYTES] = buf.getvalue()
+    # TODO[PHASE-1]: 위 의사코드를 채워 넣을 것
     raise NotImplementedError("PHASE 1: PIL 리사이즈 로직 미구현 (스카폴딩 슬롯)")
 
 
-def render_mask_canvas() -> None:
-    """streamlit-drawable-canvas 위젯을 렌더링하고 마스크를 session_state 에 저장.
-
-    NOTE (PHASE 1 확장 지점):
-      * `from streamlit_drawable_canvas import st_canvas` 후
-        `background_image = st.session_state[SS_ORIGIN_IMAGE]`,
-        `drawing_mode="freedraw"`, `stroke_width=20`, `update_streamlit=True`
-        설정으로 호출하라.
-      * `st_canvas` 의 `image_data[:,:,3]` 알파 채널을 0/255 이진화하여
-        `SS_MASK_ARRAY` 로 저장하면 PHASE 3 의 cv2.transform 마스킹과 호환된다.
-    """
-    st.info("🖌️ (PHASE 1) drawable-canvas 마스크 UI 가 여기에 렌더링될 예정입니다.")
-    # TODO[PHASE-1]: canvas_result = st_canvas(...)
-    # TODO[PHASE-1]: st.session_state[SS_MASK_ARRAY] = binarize(canvas_result.image_data)
-
-
-def render_phase1_input_panel() -> None:
-    """PHASE 1 의 통합 UI 패널 (업로드 + 캔버스)."""
-    st.subheader("1️⃣ 이미지 입력 & 마스킹")
-    up = st.file_uploader("원본 이미지 업로드 (JPG/PNG)", type=["jpg", "jpeg", "png"])
-    if up is not None:
-        try:
-            handle_image_upload(up)
-        except NotImplementedError as e:
-            st.warning(str(e))
-    render_mask_canvas()
-
-
 # =============================================================================
-# PHASE 2: AI SIMULATION  —  RAG + GPT-4o 멀티모달 호출
-#   - reflectance + illuminant 컨텍스트 조립 → 프롬프트 합성
-#   - GPT-4o 호출 → 3x4 변환 행렬(JSON) 수신 및 스키마 검증
+# PHASE 2: AI SIMULATION  —  RAG + GPT-4o-mini (텍스트 JSON 전용)
+#   - reflectance.spectral_values + illuminant.spd_data 만 프롬프트에 결합
+#   - 이미지는 보내지 않음 (저비용 + 환각 방지)
+#   - GPT-4o-mini 호출 → 3x4 변환 행렬(JSON) 수신 및 스키마 검증
 # =============================================================================
 
-# 3x4 매트릭스 JSON 의 기대 스키마 (수신 검증용)
 EXPECTED_MATRIX_KEYS = {"r", "g", "b"}
 EXPECTED_MATRIX_ROW_LEN = 4  # [r0, r1, r2, bias]
 
 
-def build_rag_context(target_label: str, illuminant_name: str) -> dict:
-    """GPT-4o 프롬프트에 결합할 RAG 컨텍스트 패키지."""
-    reflectance = get_reflectance_data(target_label) or []
-    illuminant = get_illuminant_spd(illuminant_name) or {}
+def build_rag_context(subject: dict, illuminant: dict) -> dict:
+    """GPT-4o-mini 프롬프트에 결합할 RAG 컨텍스트 패키지 (이미지 X, 분광만).
+
+    Args:
+        subject:    `reflectance_library` row (spectral_values, is_uv_active, ...)
+        illuminant: `standard_illuminants` row (spd_data, name, ...)
+    """
     return {
-        "target_label": target_label,
-        "illuminant": illuminant,
-        "reflectance_samples": reflectance,
+        "subject": {
+            "label": subject.get("label"),
+            "category": subject.get("category"),
+            "is_uv_active": subject.get("is_uv_active"),
+            "spectral_values": subject.get("spectral_values"),  # 300–700nm, 41pt, 0–1
+        },
+        "illuminant": {
+            "name": illuminant.get("name"),
+            "spd_data": illuminant.get("spd_data"),
+        },
     }
 
 
 def validate_matrix_payload(payload: Any) -> bool:
-    """GPT-4o 가 반환한 JSON 이 3x4 매트릭스 규약을 따르는지 검증."""
+    """GPT-4o-mini 가 반환한 JSON 이 3x4 매트릭스 규약을 따르는지 검증."""
     if not isinstance(payload, dict):
         return False
     if not EXPECTED_MATRIX_KEYS.issubset(payload.keys()):
@@ -189,126 +201,95 @@ def validate_matrix_payload(payload: Any) -> bool:
     return True
 
 
-def call_gpt4o_for_matrix(rag_context: dict, image_bytes: bytes) -> dict:
-    """GPT-4o 멀티모달 호출 → 3x4 변환 행렬 JSON.
+def call_gpt4o_mini_for_matrix(rag_context: dict) -> dict:
+    """GPT-4o-mini 호출 → 3x4 변환 행렬 JSON. **이미지는 전달하지 않는다.**
 
     NOTE (PHASE 2 확장 지점):
-      * `from openai import OpenAI; client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])`
-      * `client.chat.completions.create(model="gpt-4o", response_format={"type":"json_object"}, ...)`
-      * 시스템 프롬프트에 `rag_context` 를 JSON 직렬화하여 주입하라.
+      * `from openai import OpenAI`
+      * `client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or st.secrets["openai"]["api_key"])`
+      * `client.chat.completions.create(`
+            `model="gpt-4o-mini",`
+            `response_format={"type":"json_object"},`
+            `messages=[{"role":"system","content": SYSTEM_PROMPT},`
+            `          {"role":"user","content": json.dumps(rag_context)}])`
       * 반환 직후 반드시 `validate_matrix_payload()` 로 검증하고,
         실패 시 1회 retry → 그래도 실패하면 항등행렬을 fallback 으로 반환.
     """
-    # TODO[PHASE-2]: 실제 OpenAI 호출 구현
-    raise NotImplementedError("PHASE 2: GPT-4o 호출 로직 미구현 (스카폴딩 슬롯)")
+    # TODO[PHASE-2]: 실제 OpenAI 호출 구현 (gpt-4o-mini, JSON-only, 텍스트 입력)
+    raise NotImplementedError("PHASE 2: GPT-4o-mini 호출 로직 미구현 (스카폴딩 슬롯)")
 
 
-def render_phase2_simulation_panel(illuminant_name: str) -> None:
-    """PHASE 2 의 UI 패널 (RAG 미리보기 + 시뮬레이션 트리거)."""
-    st.subheader("2️⃣ RAG 컨텍스트 & AI 시뮬레이션")
-    target_label = st.text_input(
-        "조회할 피사체 라벨 (예: Mallard Duck)",
-        "Mallard Duck",
-        key="phase2_label",
-    )
-
-    if st.button("🔍 RAG 컨텍스트 미리보기"):
-        ctx = build_rag_context(target_label, illuminant_name)
-        st.json(ctx)
-
-    if st.button("🤖 GPT-4o 시뮬레이션 실행"):
-        ctx = build_rag_context(target_label, illuminant_name)
-        try:
-            matrix = call_gpt4o_for_matrix(ctx, st.session_state.get(SS_ORIGIN_BYTES, b""))
-            if not validate_matrix_payload(matrix):
-                st.error("⚠️ GPT-4o 응답이 3x4 매트릭스 스키마를 위반했습니다.")
-                return
-            st.session_state[SS_MATRIX] = matrix
-            st.success("✅ 3x4 매트릭스 수신 완료")
-            st.json(matrix)
-        except NotImplementedError as e:
-            st.warning(str(e))
+# Backward-compat alias — 기존에 이미지 인자를 받던 시그니처가 코드 어딘가에 박혀있을 수
+# 있으므로 keyword-only 로 image_bytes 를 받지만 무시한다.
+def call_gpt4o_for_matrix(rag_context: dict, image_bytes: bytes | None = None) -> dict:
+    """Deprecated. 이미지 입력은 무시되며 텍스트 전용 mini 호출로 위임된다."""
+    return call_gpt4o_mini_for_matrix(rag_context)
 
 
 # =============================================================================
-# PHASE 3: LOCAL PIXEL TRANSFORM  —  OpenCV + 5색 추출 + 5x10 명채도 타일
-#   - cv2.transform() 으로 마스크 영역에만 3x4 행렬 적용
-#   - K-Means 등으로 대표 5색 추출
-#   - HSL 변환 후 10% 단위 명도 가공 루프 → 5x10 = 50 타일 (휘발성, DB 미저장)
+# PHASE 3: LOCAL PIXEL TRANSFORM  —  numpy + OKLCH 5x10 명채도 타일
+#   - numpy 로 3x4 행렬을 픽셀 전체에 실시간 적용 (마스킹은 향후 옵션)
+#   - K-Means 등으로 대표 5색 추출 → palettes.base_colors 로만 저장
+#   - 5x10 타일은 OKLCH 색공간에서 L 만 변주하여 클라이언트에서 즉시 재계산
 # =============================================================================
 
 
-def apply_matrix_to_masked_region(
-    image_bytes: bytes,
-    mask_array,  # np.ndarray | None
-    matrix: dict,
-) -> bytes:
-    """cv2.transform 으로 마스크 영역에만 3x4 변환을 적용.
+def apply_matrix(image_bytes: bytes, matrix: dict) -> bytes:
+    """3x4 색변환 행렬을 numpy 로 적용 (마스킹 없이 전체 픽셀).
 
     NOTE (PHASE 3 확장 지점):
-      * `import cv2, numpy as np`
-      * `img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)`
+      * `import numpy as np; from PIL import Image`
+      * `img = np.asarray(Image.open(io.BytesIO(image_bytes)).convert("RGB"), dtype=np.float32) / 255.0`
       * `M = np.array([matrix["r"], matrix["g"], matrix["b"]], dtype=np.float32)`  # (3,4)
-      * `transformed = cv2.transform(img, M)`
-      * `out = np.where(mask_array[..., None] > 0, transformed, img)`
-      * return cv2.imencode(".png", out)[1].tobytes()
+      * `rgb1 = np.concatenate([img, np.ones(img.shape[:2]+(1,), np.float32)], axis=-1)`
+      * `out = np.clip(rgb1 @ M.T, 0, 1)`
+      * `buf = io.BytesIO(); Image.fromarray((out*255).astype(np.uint8)).save(buf, "PNG"); return buf.getvalue()`
     """
-    # TODO[PHASE-3]: 실제 OpenCV 연산 구현
-    raise NotImplementedError("PHASE 3: cv2.transform 미구현 (스카폴딩 슬롯)")
+    # TODO[PHASE-3]: 실제 numpy 변환 구현 — OpenCV 는 선택 사항 (cv2.transform 도 가능)
+    raise NotImplementedError("PHASE 3: 3x4 색변환 미구현 (스카폴딩 슬롯)")
 
 
 def extract_base_colors(image_bytes: bytes, k: int = 5) -> list[str]:
     """결과 이미지에서 K-Means 로 대표 K개 HEX 색상 추출."""
-    # TODO[PHASE-3]: from sklearn.cluster import KMeans 또는 cv2.kmeans 사용
+    # TODO[PHASE-3]: from sklearn.cluster import KMeans (또는 cv2.kmeans) 로 K=5 클러스터링
     raise NotImplementedError("PHASE 3: 대표 색상 추출 미구현 (스카폴딩 슬롯)")
 
 
+# ---------- OKLCH 기반 5×10 명채도 타일 -----------------------------------------
+def make_shades(
+    hex_color: str,
+    n: int = 10,
+    l_min: float = 0.15,
+    l_max: float = 0.95,
+) -> list[str]:
+    """OKLCH 색공간에서 명도(L) 만 균등 변주하여 n 단계 색상 HEX 리스트를 생성.
+
+    `coloraide` 의 `.fit()` 로 sRGB 게이먯 클램핑 → 양 끝 뭉개짐 방지.
+    """
+    try:
+        from coloraide import Color
+    except Exception:
+        # coloraide 미설치 시 단순 fallback (원본만 n회 반복) — 사용자 가시성 위해 노출
+        return [hex_color] * n
+
+    base = Color(hex_color).convert("oklch")
+    shades: list[str] = []
+    for i in range(n):
+        new_l = l_min + (l_max - l_min) * i / (n - 1)
+        c = Color("oklch", [new_l, base["chroma"], base["hue"]])
+        shades.append(c.convert("srgb").fit().to_string(hex=True))
+    return shades
+
+
 def build_5x10_tile_grid(base_colors: list[str]) -> list[list[str]]:
-    """5색 × 10단계 명도 매트릭스(5x10)를 HSL 변환 기반으로 생성.
+    """5색 × 10단계 명도 매트릭스(5x10)를 OKLCH 변주로 생성.
 
     이 결과는 **DB 에 저장하지 않는** 휘발성 데이터다 (설계 원칙).
-    매번 `base_colors` 로부터 재계산되며 session_state[SS_TILE_GRID] 에만 캐싱된다.
-
-    NOTE (PHASE 3 확장 지점):
-      * `import colorsys` 로 HEX→RGB→HLS 변환 후 L 채널을 0.05~0.95 범위에서
-        10단계로 균등 샘플링하여 HEX 로 재인코딩하라.
+    매번 `base_colors` 로부터 재계산되며 `st.session_state[SS_TILE_GRID]` 에만 캐싱된다.
     """
-    # TODO[PHASE-3]: HSL 명도 루프 구현
-    raise NotImplementedError("PHASE 3: 5x10 타일 생성 미구현 (스카폴딩 슬롯)")
-
-
-def render_phase3_transform_panel() -> None:
-    """PHASE 3 의 UI 패널 (변환 결과 + 5x10 타일 미리보기)."""
-    st.subheader("3️⃣ 로컬 픽셀 변환 & 5×10 명채도 타일")
-    if st.session_state.get(SS_MATRIX) is None:
-        st.info("PHASE 2 에서 매트릭스를 먼저 수신해야 합니다.")
-        return
-
-    if st.button("🎨 변환 실행"):
-        try:
-            result_bytes = apply_matrix_to_masked_region(
-                st.session_state.get(SS_ORIGIN_BYTES, b""),
-                st.session_state.get(SS_MASK_ARRAY),
-                st.session_state[SS_MATRIX],
-            )
-            colors = extract_base_colors(result_bytes, k=5)
-            st.session_state[SS_BASE_COLORS] = colors
-            st.session_state[SS_TILE_GRID] = build_5x10_tile_grid(colors)
-            st.success("✅ 변환 및 타일 생성 완료")
-        except NotImplementedError as e:
-            st.warning(str(e))
-
-    # 5x10 그리드 렌더링 (휘발성, DB 미저장)
-    grid = st.session_state.get(SS_TILE_GRID)
-    if grid:
-        st.caption("5×10 명채도 매트릭스 (휘발성 — DB 미저장)")
-        for row in grid:
-            cols = st.columns(len(row))
-            for c, hex_code in zip(cols, row):
-                c.markdown(
-                    f"<div style='background:{hex_code};height:32px;border-radius:4px;'></div>",
-                    unsafe_allow_html=True,
-                )
+    if not base_colors:
+        return []
+    return [make_shades(c, n=10) for c in base_colors]
 
 
 # =============================================================================
@@ -319,6 +300,9 @@ def render_phase3_transform_panel() -> None:
 #     * 비즈니스 규칙: palettes 는 projects 보다 먼저 만들 수 없다.
 #       projects ON DELETE CASCADE 로 palettes 가 자동 삭제됨.
 #     * parent_id (projects 셀프 FK) 는 수정 스냅샷 / 스크랩 복제 시 채워짐.
+#     * 신규 컬럼:
+#         - subject_id  (FK -> reflectance_library)
+#         - is_palette_public (BOOLEAN DEFAULT TRUE)
 # =============================================================================
 
 BUCKET_ORIGINALS = "originals"
@@ -326,12 +310,7 @@ BUCKET_RESULTS = "results"
 
 
 def ensure_authenticated() -> dict | None:
-    """Supabase Auth 세션을 확인하고 user 객체를 반환.
-
-    NOTE (PHASE 4 확장 지점):
-      * `conn.auth.get_user()` 또는 `st_supabase_connection` 의 OAuth 위젯으로 대체.
-      * 비로그인 시 None 반환 + UI 단에서 로그인 버튼 노출.
-    """
+    """Supabase Auth 세션 체크."""
     return st.session_state.get(SS_AUTH_USER)
 
 
@@ -342,8 +321,19 @@ def upload_to_storage(bucket: str, path: str, data: bytes) -> str:
     raise NotImplementedError("PHASE 4: Storage 업로드 미구현 (스카폴딩 슬롯)")
 
 
-def save_simulation_result(user_id, matrix, origin_url, base_colors):
-    """프로젝트 + 팔레트 동시 저장 (기존 시그니처 보호).
+def save_simulation_result(
+    user_id,
+    matrix,
+    origin_url,
+    base_colors,
+    *,
+    subject_id: str | None = None,
+    illu_id: str | None = None,
+    result_url: str | None = None,
+    is_anonymous: bool | None = None,
+    is_palette_public: bool | None = None,
+):
+    """프로젝트 + 팔레트 동시 저장 (기존 시그니처 보호 + 신규 키워드 인자).
 
     [데이터 무결성 규칙]
       * projects 가 먼저 INSERT 되어 `id` 가 확정되어야 palettes.project_id 가
@@ -352,23 +342,40 @@ def save_simulation_result(user_id, matrix, origin_url, base_colors):
       * `parent_id` 셀프 FK 는 본 함수에서는 NULL 이며, 수정/스크랩 흐름에서
         `save_snapshot()` / `scrap_project()` 가 채워준다.
       * `palettes` 는 projects 에 대해 ON DELETE CASCADE 이므로 별도 정리 불필요.
+      * `subject_id`, `illu_id` 는 RAG 추론 근거로서 별도 컬럼에 보존된다.
     """
-    # (1) 데이터 준비 및 실행
     data_to_insert = {
         "owner_id": user_id,
+        "subject_id": subject_id,
+        "illu_id": illu_id,
         "matrix_json": matrix,
         "origin_path": origin_url,
-        "is_anonymous": st.session_state.get(SS_IS_ANON, False),
+        "result_path": result_url,
+        "is_anonymous": (
+            is_anonymous
+            if is_anonymous is not None
+            else st.session_state.get(SS_IS_ANON, False)
+        ),
+        "is_palette_public": (
+            is_palette_public
+            if is_palette_public is not None
+            else st.session_state.get(SS_IS_PALETTE_PUBLIC, True)
+        ),
         "status": "Active",
         "scrap_count": 0,
     }
+    # None 값은 DB default 로 위임 (NOT NULL 컬럼 보호)
+    data_to_insert = {k: v for k, v in data_to_insert.items() if v is not None}
 
     project_resp = conn.table("projects").insert(data_to_insert).execute()
 
-    # (2) 결과가 있으면 ID 추출 → palettes 연쇄 INSERT
     if project_resp.data:
         try:
-            row = project_resp.data[0] if isinstance(project_resp.data, list) else project_resp.data
+            row = (
+                project_resp.data[0]
+                if isinstance(project_resp.data, list)
+                else project_resp.data
+            )
             p_id = row["id"]
             conn.table("palettes").insert(
                 {"project_id": p_id, "base_colors": base_colors}
@@ -386,40 +393,14 @@ def save_snapshot(parent_project_id: str, matrix, origin_url, result_url, base_c
       * 기존 row 를 UPDATE 하지 않고 새 row 를 INSERT 한 뒤 `parent_id` 로 부모를
         가리킨다. 갤러리/히스토리는 parent_id 그래프를 따라간다.
     """
-    # TODO[PHASE-4]: 위 save_simulation_result 와 유사하나 parent_id 필드 추가
+    # TODO[PHASE-4]: save_simulation_result 와 유사하나 parent_id 필드 추가
     raise NotImplementedError("PHASE 4: 스냅샷 INSERT 미구현 (스카폴딩 슬롯)")
 
 
-def render_phase4_save_panel() -> None:
-    """PHASE 4 의 UI 패널 (로그인 체크 + 저장)."""
-    st.subheader("4️⃣ 영속성 — Storage 업로드 & DB 저장")
-    user = ensure_authenticated()
-    st.session_state[SS_IS_ANON] = st.checkbox(
-        "익명의 창작자로 공유", value=st.session_state.get(SS_IS_ANON, False)
-    )
-
-    if st.button("💾 결과 저장"):
-        if user is None and not st.session_state.get(SS_IS_ANON):
-            st.error("로그인이 필요합니다. (또는 익명 공유를 선택하세요)")
-            return
-        try:
-            # TODO[PHASE-4]: 실제 Storage 업로드로 교체
-            origin_url = "https://example.com/origin.png"
-            msg = save_simulation_result(
-                user_id=(user or {}).get("id"),
-                matrix=st.session_state.get(SS_MATRIX, {"r": [1, 0, 0, 0], "g": [0, 1, 0, 0], "b": [0, 0, 1, 0]}),
-                origin_url=origin_url,
-                base_colors=st.session_state.get(SS_BASE_COLORS, []),
-            )
-            st.info(msg)
-        except Exception as e:
-            st.error(f"저장 실패: {e}")
-
-
 # =============================================================================
-# PHASE 5: BUSINESS LOGIC  —  갤러리 / 스크랩 / 조건부 삭제
+# PHASE 5: BUSINESS LOGIC  —  갤러리 / 스크랩(익명 카운트) / 조건부 삭제
 #   - '익명의 창작자' DB View 호출 (예: anon_gallery_view)
-#   - 스크랩 시 복제본 INSERT (parent_id) + 원본 scrap_count += 1
+#   - 스크랩은 익명 카운트만 누적: scrap_count += 1 (누가 했는지는 추적하지 않음)
 #   - 조건부 삭제: scrap_count >= 1 OR (now - created_at) < 30일  →
 #       즉시 삭제 불가, status = 'Pending_Deletion' 로 전이 + 배너 노출
 # =============================================================================
@@ -427,13 +408,16 @@ def render_phase4_save_panel() -> None:
 SHARE_LOCK_DAYS = 30  # 공유 후 즉시 삭제 잠금 기간
 
 
-def fetch_anon_gallery(limit: int = 20) -> list[dict]:
-    """'익명의 창작자' 갤러리 피드 (DB View 호출)."""
-    # TODO[PHASE-5]: conn.table("anon_gallery_view").select("*").limit(limit).execute()
+def fetch_my_shared_projects(owner_id: str | None, limit: int = 20) -> list[dict]:
+    """좌측 사이드바 — '내가 공유한' 라인업."""
+    if not owner_id:
+        return []
     try:
         resp = (
-            conn.table("anon_gallery_view")
-            .select("*")
+            conn.table("projects")
+            .select("id, origin_path, result_path, scrap_count, created_at, status, subject_id, illu_id, is_anonymous")
+            .eq("owner_id", owner_id)
+            .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
@@ -442,40 +426,87 @@ def fetch_anon_gallery(limit: int = 20) -> list[dict]:
         return []
 
 
-def scrap_project(source_project_id: str, new_owner_id: str) -> str | None:
-    """타인의 프로젝트를 스크랩(복제) — parent_id 로 부모를 가리키는 새 row 생성.
+def fetch_others_shared_projects(owner_id: str | None, limit: int = 20) -> list[dict]:
+    """좌측 사이드바 — '남이 공유한' 라인업 (anon_gallery_view 우선, 실패 시 projects fallback)."""
+    try:
+        q = conn.table("anon_gallery_view").select("*").limit(limit)
+        if owner_id:
+            q = q.neq("owner_id", owner_id)
+        resp = q.execute()
+        return resp.data or []
+    except Exception:
+        try:
+            q = (
+                conn.table("projects")
+                .select("id, origin_path, result_path, scrap_count, created_at, status, subject_id, illu_id, is_anonymous")
+                .eq("is_anonymous", True)
+                .order("created_at", desc=True)
+                .limit(limit)
+            )
+            if owner_id:
+                q = q.neq("owner_id", owner_id)
+            resp = q.execute()
+            return resp.data or []
+        except Exception:
+            return []
+
+
+def fetch_palette_for_project(project_id: str) -> list[str]:
+    """프로젝트에 매달린 palettes.base_colors 조회."""
+    try:
+        resp = (
+            conn.table("palettes")
+            .select("base_colors")
+            .eq("project_id", project_id)
+            .limit(1)
+            .execute()
+        )
+        data = resp.data or []
+        if not data:
+            return []
+        return list(data[0].get("base_colors") or [])
+    except Exception:
+        return []
+
+
+def scrap_project(source_project_id: str, current_scrap_count: int) -> str:
+    """타인의 프로젝트를 스크랩 — 익명 카운트만 +1.
 
     [비즈니스 규칙]
-      * 원본 projects.scrap_count += 1 (RPC 또는 SELECT-then-UPDATE).
-      * 새 row 는 owner_id = 스크랩한 사용자, parent_id = source_project_id.
+      * 누가 스크랩했는지는 추적하지 않는다 (요구사항: "인원수만").
       * 원본 status 가 'Pending_Deletion' 이면 스크랩 불가 (UI 단에서 버튼 비활성).
     """
-    # TODO[PHASE-5]: SELECT source → INSERT clone → UPDATE source.scrap_count
-    raise NotImplementedError("PHASE 5: 스크랩 로직 미구현 (스카폴딩 슬롯)")
+    try:
+        conn.table("projects").update(
+            {"scrap_count": (current_scrap_count or 0) + 1}
+        ).eq("id", source_project_id).execute()
+        return "✅ 스크랩 완료 (익명 카운트 +1)"
+    except Exception as e:
+        return f"❌ 스크랩 실패: {e}"
 
 
 def request_project_deletion(project_id: str, created_at_iso: str, scrap_count: int) -> str:
-    """삭제 요청 처리.
+    """삭제 요청 — 조건부 분기.
 
-    [조건부 분기]
-      * scrap_count >= 1  →  즉시 삭제 불가 (다른 사용자가 스크랩 사용 중)
-      * 공유 후 30일 미만  →  즉시 삭제 불가 (공유 잠금 기간)
-      * 둘 다 해당 없음   →  실제 DELETE (CASCADE 로 palettes 동반 삭제)
-      * 위 두 조건 중 하나라도 걸리면 status='Pending_Deletion' 로 전이하고
-        UI 에 '삭제 예정' 배너 노출.
+    * scrap_count >= 1   → 즉시 삭제 불가 (다른 사용자가 스크랩 사용 중)
+    * 공유 후 30일 미만  → 즉시 삭제 불가
+    * 둘 다 해당 없음    → 실제 DELETE (CASCADE 로 palettes 동반 삭제)
     """
     try:
         created_at = datetime.fromisoformat(created_at_iso.replace("Z", "+00:00"))
     except Exception:
         created_at = datetime.utcnow()
 
-    locked_by_scrap = scrap_count >= 1
-    locked_by_period = (datetime.utcnow() - created_at.replace(tzinfo=None)) < timedelta(days=SHARE_LOCK_DAYS)
+    locked_by_scrap = (scrap_count or 0) >= 1
+    locked_by_period = (
+        datetime.utcnow() - created_at.replace(tzinfo=None)
+    ) < timedelta(days=SHARE_LOCK_DAYS)
 
     if locked_by_scrap or locked_by_period:
-        # 조건부 삭제 대기 상태로 전이
         try:
-            conn.table("projects").update({"status": "Pending_Deletion"}).eq("id", project_id).execute()
+            conn.table("projects").update({"status": "Pending_Deletion"}).eq(
+                "id", project_id
+            ).execute()
         except Exception:
             pass
         reasons = []
@@ -489,43 +520,440 @@ def request_project_deletion(project_id: str, created_at_iso: str, scrap_count: 
     return "🗑️ 즉시 삭제 가능 (실제 DELETE 호출은 PHASE 5 구현 시 활성화)."
 
 
-def render_pending_deletion_banner(project: dict) -> None:
-    """status == 'Pending_Deletion' 인 프로젝트에 대해 배너 + 스크랩 버튼 비활성."""
-    if project.get("status") == "Pending_Deletion":
-        st.warning(
-            "⚠️ 이 프로젝트는 **삭제 예정** 상태입니다. "
-            "신규 스크랩이 비활성화되며, 잠금 해제 시 자동 삭제됩니다."
+# =============================================================================
+# UI COMPONENTS
+# =============================================================================
+
+# ---------- 좌측 사이드바: 프로필 + 라인업 ---------------------------------------
+def render_sidebar() -> None:
+    """좌측: 프로필 + '내가 공유한' / '남이 공유한' 미리보기 라인업.
+
+    프로필 이미지는 현재 보류(요구사항). 닉네임 + UID 만 노출.
+    """
+    user = ensure_authenticated() or {}
+    with st.sidebar:
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            st.markdown(f"**{user.get('nickname') or 'user_nickname'}**")
+            st.caption(f"@{(user.get('id') or 'user_UID')[:8]}")
+        with col_b:
+            st.button("⚙️", key="open_settings", help="설정")
+
+        st.divider()
+
+        st.caption("내가 공유한 미리보기")
+        _render_lineup(
+            fetch_my_shared_projects(user.get("id"), limit=10),
+            key_prefix="mine",
         )
-        st.button(
-            "📌 스크랩하기",
-            key=f"scrap_{project.get('id', uuid.uuid4())}",
-            disabled=True,
-            help="삭제 예정 프로젝트는 스크랩할 수 없습니다.",
+
+        st.divider()
+        st.caption("내가 공유받은(남이 공유한) 미리보기")
+        _render_lineup(
+            fetch_others_shared_projects(user.get("id"), limit=10),
+            key_prefix="others",
         )
-    else:
-        if st.button("📌 스크랩하기", key=f"scrap_{project.get('id', uuid.uuid4())}"):
-            try:
-                scrap_project(project["id"], (ensure_authenticated() or {}).get("id"))
-                st.success("스크랩 완료")
-            except NotImplementedError as e:
-                st.warning(str(e))
 
 
-def render_phase5_gallery_panel() -> None:
-    """PHASE 5 의 UI 패널 (갤러리 + 스크랩 + 삭제 요청)."""
-    st.subheader("5️⃣ 익명의 창작자 갤러리")
-    items = fetch_anon_gallery(limit=12)
+def _render_lineup(items: list[dict], key_prefix: str) -> None:
+    """라인업 카드 (작은 미리보기 + 클릭 시 모달 오픈)."""
     if not items:
-        st.caption("아직 공유된 프로젝트가 없거나 anon_gallery_view 가 비어 있습니다.")
+        st.caption("_(아직 공유된 항목이 없습니다)_")
         return
-    for proj in items:
-        with st.container(border=True):
-            st.markdown(f"**프로젝트** `{proj.get('id', '')[:8]}…`")
-            cols = st.columns([3, 1])
-            with cols[0]:
-                st.json({k: proj.get(k) for k in ("status", "scrap_count", "is_anonymous")})
-            with cols[1]:
-                render_pending_deletion_banner(proj)
+    cols = st.columns(2)
+    for i, proj in enumerate(items):
+        with cols[i % 2]:
+            with st.container(border=True):
+                st.markdown(
+                    f"<div style='height:60px;background:#f0f0f0;border-radius:4px;"
+                    f"display:flex;align-items:center;justify-content:center;font-size:11px;color:#888;'>"
+                    f"image prev</div>",
+                    unsafe_allow_html=True,
+                )
+                # 팔레트 5색 strip
+                colors = fetch_palette_for_project(proj["id"])[:5]
+                if colors:
+                    strip = "".join(
+                        f"<div style='flex:1;height:14px;background:{c};'></div>" for c in colors
+                    )
+                    st.markdown(
+                        f"<div style='display:flex;margin-top:4px;border-radius:4px;overflow:hidden;'>{strip}</div>",
+                        unsafe_allow_html=True,
+                    )
+                st.caption(f"palette {len(colors)}color")
+                if st.button(
+                    "Palette Title",
+                    key=f"{key_prefix}_open_{proj['id']}",
+                    use_container_width=True,
+                ):
+                    show_project_modal(proj, mode="view")
+
+
+# ---------- 중앙: 원본 이미지 + 태그 패널 ---------------------------------------
+def render_original_image_panel() -> None:
+    """중앙 상단: 원본 이미지 프리뷰."""
+    with st.container(border=True):
+        img = st.session_state.get(SS_ORIGIN_IMAGE)
+        if img is not None:
+            st.image(img, use_column_width=True)
+        else:
+            st.markdown(
+                "<div style='height:320px;display:flex;align-items:center;"
+                "justify-content:center;font-size:28px;color:#888;'>"
+                "Original<br>Image<br>Preview</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def render_tag_panel() -> None:
+    """중앙 하단: 피사체 / 광원 태그 탭 (각각 단일 선택)."""
+    st.markdown("**Tags**")
+    tabs = st.tabs(["🦆 피사체 (Subject · 50)", "💡 광원 (Illuminant · 5)"])
+    with tabs[0]:
+        _render_subject_tag_grid()
+    with tabs[1]:
+        _render_illuminant_tag_grid()
+    st.caption("Orange: Selected · Gray: Not Selected")
+
+
+def _render_subject_tag_grid() -> None:
+    q = st.text_input(
+        "Tag Search",
+        key="subject_search",
+        placeholder="검색 (예: Mallard, Bird, Flower …)",
+        label_visibility="collapsed",
+    )
+    subjects = list_subjects()
+    if q:
+        ql = q.lower()
+        subjects = [
+            s for s in subjects
+            if ql in (s.get("label") or "").lower()
+            or ql in (s.get("category") or "").lower()
+        ]
+
+    sel = st.session_state.get(SS_SELECTED_SUBJECT) or {}
+    sel_id = sel.get("id")
+
+    if not subjects:
+        st.caption("_(피사체 데이터가 없습니다. reflectance_library 에 INSERT 가 필요합니다)_")
+        return
+
+    cols = st.columns(4)
+    for i, subj in enumerate(subjects):
+        with cols[i % 4]:
+            is_sel = subj["id"] == sel_id
+            label = subj["label"]
+            if subj.get("is_uv_active"):
+                label = f"✦ {label}"
+            if st.button(
+                label,
+                key=f"subj_{subj['id']}",
+                type=("primary" if is_sel else "secondary"),
+                use_container_width=True,
+            ):
+                # 단일 선택 — 다시 클릭 시 토글 해제
+                if is_sel:
+                    st.session_state[SS_SELECTED_SUBJECT] = None
+                else:
+                    st.session_state[SS_SELECTED_SUBJECT] = subj
+                st.rerun()
+
+
+def _render_illuminant_tag_grid() -> None:
+    illus = list_illuminants()
+    sel = st.session_state.get(SS_SELECTED_ILLU) or {}
+    sel_id = sel.get("id")
+
+    if not illus:
+        st.caption("_(광원 데이터가 없습니다. standard_illuminants 에 INSERT 가 필요합니다)_")
+        return
+
+    cols = st.columns(min(5, len(illus)))
+    for i, illu in enumerate(illus):
+        with cols[i % len(cols)]:
+            is_sel = illu["id"] == sel_id
+            if st.button(
+                illu["name"],
+                key=f"illu_{illu['id']}",
+                type=("primary" if is_sel else "secondary"),
+                use_container_width=True,
+                help=illu.get("description") or "",
+            ):
+                if is_sel:
+                    st.session_state[SS_SELECTED_ILLU] = None
+                else:
+                    st.session_state[SS_SELECTED_ILLU] = illu
+                st.rerun()
+
+
+# ---------- 우측: 변환 결과 + 5x10 그리드 ---------------------------------------
+def render_converted_image_panel() -> None:
+    with st.container(border=True):
+        result = st.session_state.get(SS_RESULT_BYTES)
+        if result:
+            st.image(result, use_column_width=True)
+        else:
+            st.markdown(
+                "<div style='height:240px;display:flex;align-items:center;"
+                "justify-content:center;font-size:24px;color:#888;'>"
+                "Converted<br>Image<br>Preview</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def render_5x10_grid() -> None:
+    """5×10 명채도 매트릭스 (휘발성 — DB 미저장)."""
+    with st.container(border=True):
+        grid = st.session_state.get(SS_TILE_GRID) or []
+        if not grid:
+            st.markdown(
+                "<div style='height:200px;display:flex;align-items:center;"
+                "justify-content:center;font-size:28px;color:#888;'>5 × 10</div>",
+                unsafe_allow_html=True,
+            )
+            return
+        st.caption("5 × 10  (OKLCH 명도 변주 · 휘발성)")
+        for row in grid:
+            row_html = "".join(
+                f"<div style='flex:1;height:24px;background:{hex_code};'></div>"
+                for hex_code in row
+            )
+            st.markdown(
+                f"<div style='display:flex;gap:1px;margin-bottom:1px;border-radius:3px;overflow:hidden;'>{row_html}</div>",
+                unsafe_allow_html=True,
+            )
+
+
+# ---------- 중앙↔우측 사이의 세로 버튼 컬럼 -------------------------------------
+def render_action_buttons() -> None:
+    """Upload → Convert → Finish 세로 버튼.
+
+    Convert 버튼은 피사체 + 광원 둘 다 선택돼야 활성화된다.
+    """
+    st.write("")  # 상단 여백
+
+    # ----- Upload -----
+    up = st.file_uploader(
+        "Upload",
+        type=["jpg", "jpeg", "png"],
+        key="uploader",
+        label_visibility="collapsed",
+    )
+    if up is not None and st.session_state.get("_last_upload_name") != up.name:
+        try:
+            handle_image_upload(up)
+            st.session_state["_last_upload_name"] = up.name
+            st.rerun()
+        except NotImplementedError as e:
+            st.warning(str(e))
+
+    st.write("")
+
+    # ----- Convert (gated) -----
+    subj = st.session_state.get(SS_SELECTED_SUBJECT)
+    illu = st.session_state.get(SS_SELECTED_ILLU)
+    both_selected = bool(subj) and bool(illu)
+    has_image = st.session_state.get(SS_ORIGIN_BYTES) is not None
+
+    convert_disabled = not (both_selected and has_image)
+    convert_help = None
+    if not has_image:
+        convert_help = "먼저 이미지를 업로드하세요."
+    elif not both_selected:
+        convert_help = "피사체와 광원을 모두 선택하세요."
+
+    if st.button(
+        "Convert",
+        type="primary",
+        use_container_width=True,
+        disabled=convert_disabled,
+        help=convert_help,
+    ):
+        _run_convert(subj, illu)
+
+    st.write("")
+
+    # ----- Finish -----
+    finish_disabled = not st.session_state.get(SS_BASE_COLORS)
+    if st.button(
+        "Finish",
+        use_container_width=True,
+        disabled=finish_disabled,
+        help=("Convert 를 먼저 실행하세요." if finish_disabled else None),
+    ):
+        # 현재 세션 상태를 모달에 전달하기 위해 가짜 project dict 를 합성
+        draft_project = {
+            "id": None,  # 아직 INSERT 전
+            "subject_id": (subj or {}).get("id"),
+            "illu_id": (illu or {}).get("id"),
+            "scrap_count": 0,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "is_anonymous": st.session_state.get(SS_IS_ANON, False),
+            "_subject_label": (subj or {}).get("label"),
+            "_illu_name": (illu or {}).get("name"),
+            "_base_colors": st.session_state.get(SS_BASE_COLORS) or [],
+            "_origin_bytes": st.session_state.get(SS_ORIGIN_BYTES),
+            "_result_bytes": st.session_state.get(SS_RESULT_BYTES),
+            "_matrix": st.session_state.get(SS_MATRIX),
+        }
+        show_project_modal(draft_project, mode="share")
+
+
+def _run_convert(subj: dict, illu: dict) -> None:
+    """Convert 버튼 핸들러 — RAG → GPT-4o-mini → numpy 변환 → 대표색 → 5×10."""
+    ctx = build_rag_context(subj, illu)
+    try:
+        matrix = call_gpt4o_mini_for_matrix(ctx)
+        if not validate_matrix_payload(matrix):
+            st.error("⚠️ GPT-4o-mini 응답이 3x4 매트릭스 스키마를 위반했습니다.")
+            return
+        st.session_state[SS_MATRIX] = matrix
+
+        result_bytes = apply_matrix(st.session_state[SS_ORIGIN_BYTES], matrix)
+        st.session_state[SS_RESULT_BYTES] = result_bytes
+
+        colors = extract_base_colors(result_bytes, k=5)
+        st.session_state[SS_BASE_COLORS] = colors
+        st.session_state[SS_TILE_GRID] = build_5x10_tile_grid(colors)
+        st.success("✅ 변환 완료")
+        st.rerun()
+    except NotImplementedError as e:
+        st.warning(f"{e}\n(스카폴딩 단계 — 실제 알고리즘은 PHASE 2/3 에서 채워집니다)")
+
+
+# ---------- 모달 (조회 / 공유 확정 — 같은 컴포넌트 재사용) ----------------------
+@st.dialog("프로젝트 미리보기", width="large")
+def show_project_modal(project: dict, mode: str = "view") -> None:
+    """`mode='view'` : 라인업 카드 클릭 시 조회.
+    `mode='share'`: Finish 버튼 클릭 시 저장+공유 확정 흐름.
+
+    같은 모달 컴포넌트를 두 모드로 재사용한다.
+    """
+    is_share = mode == "share"
+
+    # ---- 상단: 원본 + 5×10 팔레트 미리보기 ----
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown("**원본 이미지**")
+        if is_share and project.get("_origin_bytes"):
+            st.image(project["_origin_bytes"], use_column_width=True)
+        elif project.get("origin_path"):
+            st.image(project["origin_path"], use_column_width=True)
+        else:
+            st.caption("(원본 이미지 없음)")
+
+    with right:
+        st.markdown("**5×10 팔레트**")
+        if is_share:
+            base_colors = project.get("_base_colors") or []
+        else:
+            base_colors = fetch_palette_for_project(project["id"]) if project.get("id") else []
+        grid = build_5x10_tile_grid(base_colors)
+        if grid:
+            for row in grid:
+                row_html = "".join(
+                    f"<div style='flex:1;height:18px;background:{c};'></div>" for c in row
+                )
+                st.markdown(
+                    f"<div style='display:flex;gap:1px;margin-bottom:1px;'>{row_html}</div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("(팔레트 없음)")
+
+    st.divider()
+
+    # ---- 메타: 태그 / 스크랩 수 / 공유일 / 제작자 ----
+    meta_cols = st.columns(4)
+    if is_share:
+        subj_label = project.get("_subject_label")
+        illu_name = project.get("_illu_name")
+    else:
+        subj_label = _lookup_label("reflectance_library", project.get("subject_id"))
+        illu_name = _lookup_label("standard_illuminants", project.get("illu_id"), name_col="name")
+
+    meta_cols[0].metric("피사체", subj_label or "—")
+    meta_cols[1].metric("광원", illu_name or "—")
+    meta_cols[2].metric("스크랩", project.get("scrap_count", 0))
+    meta_cols[3].metric(
+        "공유일",
+        (project.get("created_at") or "")[:10] or "—",
+    )
+
+    creator = "익명의 창작자" if project.get("is_anonymous") else (project.get("owner_id") or "—")
+    st.caption(f"제작자: {creator}")
+
+    # ---- 모드별 추가 액션 ----
+    st.divider()
+    if is_share:
+        st.markdown("### 공유 옵션")
+        anon = st.checkbox(
+            "닉네임 비공개 (익명의 창작자로 공유)",
+            value=st.session_state.get(SS_IS_ANON, False),
+            key="modal_is_anon",
+        )
+        pal_pub = st.checkbox(
+            "팔레트 공개 (다른 사용자가 5×10 을 볼 수 있도록)",
+            value=st.session_state.get(SS_IS_PALETTE_PUBLIC, True),
+            key="modal_is_palette_public",
+        )
+
+        btn_cols = st.columns([1, 1])
+        if btn_cols[0].button("취소", use_container_width=True, key="modal_cancel"):
+            st.rerun()
+        if btn_cols[1].button(
+            "✅ 공유 확정",
+            type="primary",
+            use_container_width=True,
+            key="modal_confirm_share",
+        ):
+            st.session_state[SS_IS_ANON] = anon
+            st.session_state[SS_IS_PALETTE_PUBLIC] = pal_pub
+            # TODO[PHASE-4]: upload_to_storage 로 원본/결과 업로드 → URL 획득
+            origin_url = "https://example.com/origin.png"
+            result_url = "https://example.com/result.png"
+            user = ensure_authenticated() or {}
+            msg = save_simulation_result(
+                user_id=user.get("id"),
+                matrix=project.get("_matrix") or {},
+                origin_url=origin_url,
+                base_colors=project.get("_base_colors") or [],
+                subject_id=project.get("subject_id"),
+                illu_id=project.get("illu_id"),
+                result_url=result_url,
+                is_anonymous=anon,
+                is_palette_public=pal_pub,
+            )
+            st.success(msg)
+            st.rerun()
+    else:
+        # view 모드 — 스크랩 / 삭제 요청
+        if project.get("status") == "Pending_Deletion":
+            st.warning(
+                "⚠️ 이 프로젝트는 **삭제 예정** 상태입니다. "
+                "신규 스크랩이 비활성화되며, 잠금 해제 시 자동 삭제됩니다."
+            )
+            st.button("📌 스크랩하기", disabled=True, key=f"modal_scrap_{project.get('id')}")
+        else:
+            if st.button("📌 스크랩하기", key=f"modal_scrap_{project.get('id')}", type="primary"):
+                msg = scrap_project(project["id"], project.get("scrap_count", 0))
+                st.toast(msg)
+                st.rerun()
+
+
+def _lookup_label(table: str, row_id: str | None, name_col: str = "label") -> str | None:
+    if not row_id:
+        return None
+    try:
+        resp = (
+            conn.table(table).select(f"id, {name_col}").eq("id", row_id).limit(1).execute()
+        )
+        if resp.data:
+            return resp.data[0].get(name_col)
+    except Exception:
+        pass
+    return None
 
 
 # =============================================================================
@@ -535,43 +963,30 @@ def render_phase5_gallery_panel() -> None:
 def main() -> None:
     st.set_page_config(page_title="UV 모사 팔레트 연구실", page_icon="🎨", layout="wide")
     st.title("🎨 UV 모사 팔레트 연구실")
-    st.write("DB 설계자와 함께 만든 시스템이 작동하는지 확인해봅시다.")
 
-    # 사이드바: 광원 선택 + 인증 placeholder
-    st.sidebar.header("⚙️ 설정")
-    illuminant = st.sidebar.selectbox(
-        "광원을 선택하세요",
-        ["D65", "Sunrise", "UV-A"],
-        index=0,
-    )
-    st.sidebar.caption(f"선택된 광원: `{illuminant}`")
-    # TODO[PHASE-4]: 여기서 Supabase Auth 로그인 위젯 렌더링
+    render_sidebar()
 
-    tabs = st.tabs([
-        "1️⃣ Input",
-        "2️⃣ AI Simulation",
-        "3️⃣ Local Transform",
-        "4️⃣ Persist",
-        "5️⃣ Gallery",
-        "🔧 Legacy Test",
-    ])
-    with tabs[0]:
-        render_phase1_input_panel()
-    with tabs[1]:
-        render_phase2_simulation_panel(illuminant)
-    with tabs[2]:
-        render_phase3_transform_panel()
-    with tabs[3]:
-        render_phase4_save_panel()
-    with tabs[4]:
-        render_phase5_gallery_panel()
-    with tabs[5]:
+    # 본문 3-컬럼: [중앙 원본+태그] [버튼 세로 스택] [우측 결과+5x10]
+    col_center, col_buttons, col_right = st.columns([3, 0.9, 2.5])
+
+    with col_center:
+        render_original_image_panel()
+        render_tag_panel()
+
+    with col_buttons:
+        render_action_buttons()
+
+    with col_right:
+        render_converted_image_panel()
+        render_5x10_grid()
+
+    # 개발자/회귀 점검용 (Legacy)
+    with st.expander("🔧 Legacy Test Panel (개발용 — 원본 app.py 회귀 확인)"):
         _render_legacy_test_panel()
 
 
 def _render_legacy_test_panel() -> None:
     """기존 app.py 의 동작 확인용 패널 (회귀 방지)."""
-    st.subheader("🔧 기존 회귀 테스트 패널")
     target_label = st.text_input(
         "조회할 피사체 라벨을 입력하세요 (예: Mallard Duck)",
         "Mallard Duck",
