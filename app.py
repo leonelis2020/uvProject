@@ -48,40 +48,19 @@ except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
 
 
-# ── 호환성 shim: streamlit.elements.image.image_to_url ────────────────────────
-# `streamlit-drawable-canvas == 0.9.3` 은 Streamlit 내부의
-# `streamlit.elements.image.image_to_url` 에 의존한다. Streamlit 1.42 부근에서
-# 해당 함수가 다른 모듈로 옮겨졌기 때문에 신버전에서는 캔버스 호출 시
-# `AttributeError: module 'streamlit.elements.image' has no attribute 'image_to_url'`
-# 가 발생한다. 모듈 로드 시점에 신/구 경로를 모두 시도하여 가능하면 복구한다.
-# 실패해도 예외를 던지지 않으며, `_render_mask_canvas_for_region` 가 사각 영역
-# 슬라이더 폴백으로 자연스럽게 전환한다.
-def _patch_streamlit_image_to_url() -> bool:
-    try:
-        import streamlit.elements.image as _img_mod
-    except Exception:
-        return False
-    if hasattr(_img_mod, "image_to_url"):
-        return True
-    for module_path in (
-        "streamlit.elements.lib.image_utils",
-        "streamlit.elements.image_utils",
-    ):
-        try:
-            mod = __import__(module_path, fromlist=["image_to_url"])
-        except Exception:
-            continue
-        fn = getattr(mod, "image_to_url", None)
-        if fn is not None:
-            try:
-                _img_mod.image_to_url = fn  # type: ignore[attr-defined]
-                return True
-            except Exception:
-                continue
-    return False
-
-
-_STREAMLIT_CANVAS_COMPAT_OK = _patch_streamlit_image_to_url()
+# ── streamlit-drawable-canvas 호환성 정책 ─────────────────────────────────────
+# `streamlit-drawable-canvas == 0.9.3` 는 Streamlit 1.42 직전 기준으로 작성됐고,
+# 그 이후 Streamlit 이 `image_to_url` 의 시그니처(`width: int` → `layout_config`)
+# 를 바꿔서 두 가지 패턴 모두 깨진다:
+#   (a) 함수가 모듈에서 사라져 `AttributeError: ... has no attribute 'image_to_url'`
+#   (b) 함수는 찾아도 시그니처 불일치로 `AttributeError: 'int' has no attribute 'width'`
+# 이전 버전의 monkey-patch 는 (a) 만 막아주고 (b) 를 그대로 노출시키는 부작용이
+# 있었다 (시연 화면 → 모든 태그 클릭 시 트레이스백 + UI 흔들림).
+#
+# 결론: monkey-patch 를 **제거**하고, `_render_mask_canvas_for_region` 에서
+# `st_canvas` 호출을 **모든 예외에 대해** 받아 bbox 슬라이더 폴백으로 전환한다.
+# 마우스 freedraw 가 필요해지면 향후 별도 컴포넌트(custom HTML canvas 등) 로
+# 대체한다. 현재 UX 는 사각 영역 마스킹 + 멀티리전 합성으로 충분히 작동한다.
 
 # =============================================================================
 # PHASE 0: CONNECTION & MASTER LAYER
@@ -526,6 +505,20 @@ def _resolve_auth():
     return auth
 
 
+def _supabase_url_suffix(n: int = 18) -> str:
+    """진단 메시지에 노출할 Supabase 프로젝트 URL 의 짧은 식별자.
+
+    예: `https://abcdefghijkl.supabase.co` → `...lmnop.supabase.co`
+    잘못된 프로젝트에 가입되고 있는지 사용자가 빠르게 검증 가능하도록 한다.
+    전체 URL 은 노출하지 않는다 (시연 영상에 노출되더라도 안전).
+    """
+    try:
+        url = s_url or ""
+        return url[-n:] if url else "?"
+    except Exception:
+        return "?"
+
+
 def sign_up_user(email: str, password: str, nickname: str) -> str:
     """이메일 + 비밀번호 회원가입 후 `profiles` 행 생성.
 
@@ -534,35 +527,75 @@ def sign_up_user(email: str, password: str, nickname: str) -> str:
         프로젝트 설정에 따름; 확인 필요 시 메일함 안내 메시지를 반환).
       * 성공 시 `profiles(id, nickname)` 을 UPSERT. 트리거로 자동 생성되는
         프로젝트라도 nickname 만 덮어쓰므로 충돌이 없다.
+
+    [진단 메시지]
+      * 사용자가 시연 중 "회원가입 했는데 DB 에 안 보인다" 라고 자주 헷갈리는
+        지점이 두 가지:
+          (i) `auth.users` 가 아니라 `public.profiles` 만 보고 있음
+          (ii) 다른 Supabase 프로젝트에 가입되고 있음 (URL/Key 불일치)
+        둘 다 진단할 수 있도록 성공 메시지에 `user_id` + URL suffix + 어디서
+        확인하라는 안내를 함께 포함한다.
     """
     if not email or not password:
         return "❌ 이메일과 비밀번호를 입력하세요."
     if len(password) < 6:
         return "❌ 비밀번호는 6자 이상이어야 합니다."
+
+    url_suffix = _supabase_url_suffix()
+
     try:
         auth = _resolve_auth()
+    except Exception as e:
+        return f"❌ Auth 클라이언트 확보 실패: {e}"
+
+    try:
         res = auth.sign_up({"email": email, "password": password})
     except Exception as e:
-        return f"❌ 가입 실패: {e}"
+        return (
+            f"❌ Supabase sign_up 호출 실패\n"
+            f"- 프로젝트: …{url_suffix}\n"
+            f"- {type(e).__name__}: {e}"
+        )
 
     user_obj = getattr(res, "user", None)
     user_id = getattr(user_obj, "id", None) if user_obj else None
     if not user_id:
+        # 응답은 받았으나 user.id 가 비어 있는 경우 — 진단 메타데이터로 안내
+        bits = []
+        if hasattr(res, "session"):
+            bits.append(f"session={bool(getattr(res, 'session', None))}")
+        if hasattr(res, "user"):
+            bits.append(f"user={bool(getattr(res, 'user', None))}")
         return (
-            "⚠️ 가입은 시도되었으나 사용자 정보를 받지 못했습니다. "
-            "이메일 확인이 필요한 프로젝트일 수 있으니 메일함을 확인하세요."
+            f"⚠️ 가입 응답에 user.id 가 없습니다 ({', '.join(bits) or 'no diag'}).\n"
+            f"- 프로젝트: …{url_suffix}\n"
+            f"- Supabase Dashboard → Authentication → Settings 에서 "
+            f"이메일 확인 정책을 확인하세요."
         )
 
     chosen_nick = (nickname or "").strip() or email.split("@")[0]
+    profile_err: str | None = None
     try:
         conn.table("profiles").upsert(
             {"id": user_id, "nickname": chosen_nick}
         ).execute()
-    except Exception:
-        # profiles 가 트리거로 자동 생성되는 환경에서는 무시 가능
-        pass
+    except Exception as e:
+        profile_err = f"{type(e).__name__}: {e}"
 
-    return "✅ 회원가입 성공! (확인 메일이 필요한 프로젝트면 메일함을 확인하세요)"
+    msg = (
+        f"✅ 회원가입 성공!\n"
+        f"- user_id: `{user_id[:8]}…{user_id[-4:]}` (전체는 Supabase 에서 확인)\n"
+        f"- 프로젝트: …{url_suffix}\n"
+        f"- 확인 경로: **Supabase Dashboard → Authentication → Users** "
+        f"(public.profiles 는 닉네임만; auth.users 가 마스터)"
+    )
+    if profile_err:
+        msg += (
+            f"\n⚠️ profiles 행 생성은 실패했지만 auth.users 가입은 완료됨\n"
+            f"- {profile_err}\n"
+            f"- 트리거로 자동 생성되는 환경이면 무시 가능."
+        )
+    return msg
 
 
 def sign_in_user(email: str, password: str) -> str:
@@ -611,6 +644,39 @@ def sign_out_user() -> None:
     except Exception:
         pass
     st.session_state.pop(SS_AUTH_USER, None)
+
+
+def update_user_nickname(user_id: str, new_nickname: str) -> str:
+    """`profiles.nickname` UPDATE 후 메시지 반환.
+
+    Caller (`show_settings_modal`) 가 성공 시 `SS_AUTH_USER.nickname` 도
+    같이 갱신해서 사이드바가 즉시 새 닉네임으로 보이게 한다.
+    """
+    cleaned = (new_nickname or "").strip()
+    if not cleaned:
+        return "❌ 닉네임은 비어 있을 수 없습니다."
+    if len(cleaned) > 50:
+        return "❌ 닉네임은 50자 이내로 입력하세요."
+    try:
+        resp = (
+            conn.table("profiles")
+            .update({"nickname": cleaned})
+            .eq("id", user_id)
+            .execute()
+        )
+    except Exception as e:
+        return f"❌ 닉네임 변경 실패: {e}"
+
+    # 일부 환경에서는 profiles 행이 아직 없어 UPDATE 가 0건일 수 있음 — UPSERT 폴백
+    if not getattr(resp, "data", None):
+        try:
+            conn.table("profiles").upsert(
+                {"id": user_id, "nickname": cleaned}
+            ).execute()
+        except Exception as e:
+            return f"❌ profiles 행이 없어 UPSERT 도 실패: {e}"
+
+    return f"✅ 닉네임이 '{cleaned}' 으로 변경되었습니다."
 
 
 def _resolve_storage():
@@ -922,16 +988,29 @@ def render_sidebar() -> None:
 
 
 def _render_auth_panel() -> None:
-    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + 로그아웃 (인증)."""
+    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + ⚙️ + ⎋ (인증)."""
     user = ensure_authenticated()
     if user:
-        col_a, col_b = st.columns([3, 1])
+        col_a, col_b, col_c = st.columns([4, 1, 1])
         with col_a:
             st.markdown(f"**{user.get('nickname') or user.get('email') or 'user'}**")
             uid_short = (user.get("id") or "")[:8]
             st.caption(f"@{uid_short or 'user_UID'}")
         with col_b:
-            if st.button("⎋", key="signout_btn", help="로그아웃", use_container_width=True):
+            if st.button(
+                "⚙️",
+                key="settings_btn",
+                help="설정 (닉네임 변경)",
+                use_container_width=True,
+            ):
+                show_settings_modal()
+        with col_c:
+            if st.button(
+                "⎋",
+                key="signout_btn",
+                help="로그아웃",
+                use_container_width=True,
+            ):
                 sign_out_user()
                 st.rerun()
         return
@@ -967,6 +1046,9 @@ def _render_auth_panel() -> None:
             )
         if submitted_up:
             msg = sign_up_user(up_email, up_pwd, up_nick)
+            # 다중 라인 + 마크다운 가독성 보장: success/warning/error 헬퍼는
+            # 마크다운을 지원하지만 narrow sidebar 에서는 info 박스 모양이
+            # 더 안정적으로 줄바꿈된다.
             if msg.startswith("✅"):
                 st.success(msg)
             elif msg.startswith("⚠️"):
@@ -1158,17 +1240,11 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
             drawing_mode="freedraw",
             key=f"canvas_region_{region_index}",
         )
-    except AttributeError as exc:
-        if "image_to_url" in str(exc) or "streamlit.elements.image" in str(exc):
-            # Streamlit 신버전 비호환 — bbox 슬라이더 폴백.
-            _render_bbox_mask_fallback(region_index, region, img_pil)
-            return
-        raise
-    except Exception as exc:
-        st.warning(
-            f"`streamlit-drawable-canvas` 실행 중 오류가 발생했습니다: {exc}\n"
-            "사각 영역 슬라이더로 대체합니다."
-        )
+    except Exception:
+        # 어떤 예외든(AttributeError on image_to_url, TypeError on
+        # layout_config, RuntimeError 등) bbox 슬라이더 폴백으로 전환한다.
+        # 메시지를 trace 로 노출하지 않는 이유: 시연 중 매 rerun 마다 같은
+        # 트레이스가 영역마다 겹쳐 쌓여 UI 가 진동하는 현상을 막기 위함.
         _render_bbox_mask_fallback(region_index, region, img_pil)
         return
 
@@ -1492,6 +1568,54 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
         )
     st.success(f"✅ 변환 완료 · {len(regions)}개 영역 합성")
     st.rerun()
+
+
+# ---------- 모달: 설정 (⚙️) — 닉네임 편집 -------------------------------------
+@st.dialog("⚙️ 설정", width="small")
+def show_settings_modal() -> None:
+    """사이드바 ⚙️ 버튼이 여는 설정 모달.
+
+    현재 지원: 닉네임 변경 (`profiles.nickname` UPDATE/UPSERT).
+    저장 시 `SS_AUTH_USER.nickname` 도 함께 갱신하여 사이드바 표시가 즉시 반영된다.
+    """
+    user = ensure_authenticated()
+    if not user:
+        st.warning("로그인이 필요합니다.")
+        return
+
+    st.markdown(f"**계정**: `{user.get('email') or '-'}`")
+    st.caption(f"@{(user.get('id') or '')[:8]}")
+    st.divider()
+
+    current_nick = user.get("nickname") or ""
+    new_nick = st.text_input(
+        "닉네임",
+        value=current_nick,
+        key="settings_nickname_input",
+        max_chars=50,
+    )
+
+    btn_cols = st.columns([1, 1])
+    if btn_cols[0].button("취소", key="settings_cancel", use_container_width=True):
+        st.rerun()
+    if btn_cols[1].button(
+        "저장",
+        key="settings_save",
+        type="primary",
+        use_container_width=True,
+        disabled=(new_nick.strip() == current_nick.strip()),
+    ):
+        msg = update_user_nickname(user["id"], new_nick)
+        if msg.startswith("✅"):
+            # 사이드바 즉시 반영
+            st.session_state[SS_AUTH_USER] = {
+                **user,
+                "nickname": new_nick.strip(),
+            }
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
 
 
 # ---------- 모달 (조회 / 공유 확정 — 같은 컴포넌트 재사용) ----------------------

@@ -77,9 +77,9 @@ streamlit run app.py
 | `projects`              | 시뮬레이션 결과 + 메타        | `owner_id`, `parent_id (self FK)`, `subject_id (FK, 대표)`, `subject_labels (JSONB[])`, `illu_id (FK)`, `matrix_json`, `status`, `scrap_count`, `is_anonymous`, `is_palette_public` |
 | `palettes`              | 대표 5색 HEX                  | `project_id (FK CASCADE)`, `base_colors (JSONB)`                                  |
 
-> 📂 마이그레이션 SQL:
-> - [`sql/2026_06_18_add_subject_and_palette_public.sql`](sql/2026_06_18_add_subject_and_palette_public.sql) — `subject_id` FK + `is_palette_public` + 인덱스 + `anon_gallery_view`
-> - [`sql/2026_06_18_add_subject_labels.sql`](sql/2026_06_18_add_subject_labels.sql) — `subject_labels JSONB` + `anon_gallery_view` 재정의
+> 📂 **스키마 변경은 Supabase Dashboard → SQL Editor 에서 직접 적용**합니다.
+> 본 저장소는 마이그레이션 파일을 별도로 보관하지 않으며,
+> 클라이언트 코드는 변경 후의 스키마 (위 표) 를 가정하고 동작합니다.
 
 > ❗ `palettes` 는 `projects` 에 대해 `ON DELETE CASCADE` 이므로 별도 정리 불필요.
 > ❗ `projects.parent_id` 는 셀프 FK — 수정 스냅샷 & 스크랩 복제 시 부모를 가리킨다.
