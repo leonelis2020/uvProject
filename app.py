@@ -31,6 +31,21 @@ from typing import Any
 import streamlit as st
 from st_supabase_connection import SupabaseConnection
 
+# 이미지/마스크 처리 — 멀티리전 변환 합성에 필요
+# (런타임에 실제 사용되는 함수 내부에서 import 해도 되지만 모듈 최상단에 모아둔다)
+try:
+    import numpy as np
+    from PIL import Image, ImageOps
+except Exception:  # pragma: no cover - 의존성 미설치 시 import 가드
+    np = None  # type: ignore
+    Image = None  # type: ignore
+    ImageOps = None  # type: ignore
+
+try:
+    import cv2  # OpenCV — 마스크 리사이즈(INTER_NEAREST) 전용
+except Exception:  # pragma: no cover
+    cv2 = None  # type: ignore
+
 # =============================================================================
 # PHASE 0: CONNECTION & MASTER LAYER
 #   - 시스템 환경 변수 → secrets.toml 백업 순으로 자격 증명 로드 (기존 로직 보호)
@@ -128,8 +143,16 @@ SS_TILE_GRID = "tile_grid_5x10"             # list[list[str]] — 휘발성, DB 
 SS_IS_ANON = "is_anon"                      # bool — 익명 닉네임 (is_anonymous)
 SS_IS_PALETTE_PUBLIC = "is_palette_public"  # bool — 팔레트 공개 여부
 SS_AUTH_USER = "auth_user"                  # dict | None — Supabase Auth user
-SS_SELECTED_SUBJECT = "selected_subject"    # dict | None — reflectance_library row
-SS_SELECTED_ILLU = "selected_illu"          # dict | None — standard_illuminants row
+SS_SELECTED_ILLU = "selected_illu"          # dict | None — standard_illuminants row (단일)
+# ── 멀티리전(영역별 피사체) ─────────────────────────────────────────────
+# 광원은 이미지 전체 1개로 고정 (사진 한 장은 한 조명 아래 찍힌 것).
+# 피사체는 영역마다 N개 → region 리스트로 관리.
+#   region = {
+#     "subject": dict,             # reflectance_library row (label/category/spectral_values/...)
+#     "mask":    np.ndarray|None,  # H×W bool. None 이면 전체 적용
+#     "matrix":  dict|None,        # Convert 직후 채워짐 (3×4)
+#   }
+SS_REGIONS = "regions"
 
 
 # =============================================================================
@@ -142,16 +165,19 @@ SS_SELECTED_ILLU = "selected_illu"          # dict | None — standard_illuminan
 def handle_image_upload(uploaded_file) -> None:
     """업로드 파일을 1024px 썸네일로 리사이즈하고 session_state 에 저장.
 
-    NOTE (PHASE 1 확장 지점):
-      * `from PIL import Image, ImageOps`
-      * `img = ImageOps.exif_transpose(Image.open(uploaded_file).convert("RGB"))`
-      * `img.thumbnail((1024, 1024))`
-      * `buf = io.BytesIO(); img.save(buf, "PNG")`
-      * `st.session_state[SS_ORIGIN_IMAGE] = img`
-      * `st.session_state[SS_ORIGIN_BYTES] = buf.getvalue()`
+    canvas 배경 이미지로 사용되며, 멀티리전 변환의 좌표 기준이 된다.
+    EXIF 회전을 먼저 보정하지 않으면 마스크 좌표가 어긋나므로 `exif_transpose` 필수.
     """
-    # TODO[PHASE-1]: 위 의사코드를 채워 넣을 것
-    raise NotImplementedError("PHASE 1: PIL 리사이즈 로직 미구현 (스카폴딩 슬롯)")
+    if Image is None:
+        raise NotImplementedError("Pillow 미설치 — requirements 설치 필요")
+    img = Image.open(uploaded_file).convert("RGB")
+    if ImageOps is not None:
+        img = ImageOps.exif_transpose(img)
+    img.thumbnail((1024, 1024))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    st.session_state[SS_ORIGIN_IMAGE] = img
+    st.session_state[SS_ORIGIN_BYTES] = buf.getvalue()
 
 
 # =============================================================================
@@ -234,25 +260,76 @@ def call_gpt4o_for_matrix(rag_context: dict, image_bytes: bytes | None = None) -
 # =============================================================================
 
 
-def apply_matrix(image_bytes: bytes, matrix: dict) -> bytes:
-    """3x4 색변환 행렬을 numpy 로 적용 (마스킹 없이 전체 픽셀).
+# ---------- 단일 행렬 변환 (멀티리전 합성 루프가 반복 호출) -----------------------
+IDENTITY: dict = {"r": [1, 0, 0, 0], "g": [0, 1, 0, 0], "b": [0, 0, 1, 0]}
 
-    NOTE (PHASE 3 확장 지점):
-      * `import numpy as np; from PIL import Image`
-      * `img = np.asarray(Image.open(io.BytesIO(image_bytes)).convert("RGB"), dtype=np.float32) / 255.0`
-      * `M = np.array([matrix["r"], matrix["g"], matrix["b"]], dtype=np.float32)`  # (3,4)
-      * `rgb1 = np.concatenate([img, np.ones(img.shape[:2]+(1,), np.float32)], axis=-1)`
-      * `out = np.clip(rgb1 @ M.T, 0, 1)`
-      * `buf = io.BytesIO(); Image.fromarray((out*255).astype(np.uint8)).save(buf, "PNG"); return buf.getvalue()`
+
+def load_rgb(image_bytes: bytes) -> "np.ndarray":
+    """PNG/JPEG bytes → H×W×3 float32 [0,1]."""
+    if Image is None or np is None:
+        raise NotImplementedError("Pillow/numpy 미설치")
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return np.asarray(img, dtype=np.float32) / 255.0
+
+
+def to_png_bytes(arr: "np.ndarray") -> bytes:
+    """H×W×3 float [0,1] → PNG bytes."""
+    if Image is None or np is None:
+        raise NotImplementedError("Pillow/numpy 미설치")
+    arr_u8 = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(arr_u8).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def apply_matrix_array(img: "np.ndarray", matrix: dict) -> "np.ndarray":
+    """3×4 색변환 행렬을 H×W×3 float [0,1] 배열에 적용 (배열 in/out, 단일 행렬).
+
+    멀티리전 합성 루프가 영역마다 반복 호출하는 핵심 단위 함수.
+    `[r,g,b,1] @ M.T` 의 affine 형태로 bias(4번째 컬럼) 포함.
     """
-    # TODO[PHASE-3]: 실제 numpy 변환 구현 — OpenCV 는 선택 사항 (cv2.transform 도 가능)
-    raise NotImplementedError("PHASE 3: 3x4 색변환 미구현 (스카폴딩 슬롯)")
+    if np is None:
+        raise NotImplementedError("numpy 미설치")
+    M = np.array([matrix["r"], matrix["g"], matrix["b"]], dtype=np.float32)  # (3,4)
+    H, W = img.shape[:2]
+    rgb1 = np.concatenate(
+        [img, np.ones((H, W, 1), dtype=np.float32)], axis=-1
+    )  # (H,W,4)
+    out = rgb1 @ M.T  # (H,W,3)
+    return np.clip(out, 0.0, 1.0)
+
+
+def apply_matrix(image_bytes: bytes, matrix: dict) -> bytes:
+    """단일 영역(전체) 변환 — 바이트 in/out. `apply_matrix_array` 의 래퍼."""
+    img = load_rgb(image_bytes)
+    out = apply_matrix_array(img, matrix)
+    return to_png_bytes(out)
 
 
 def extract_base_colors(image_bytes: bytes, k: int = 5) -> list[str]:
-    """결과 이미지에서 K-Means 로 대표 K개 HEX 색상 추출."""
-    # TODO[PHASE-3]: from sklearn.cluster import KMeans (또는 cv2.kmeans) 로 K=5 클러스터링
-    raise NotImplementedError("PHASE 3: 대표 색상 추출 미구현 (스카폴딩 슬롯)")
+    """결과 이미지에서 K-Means 로 대표 K개 HEX 색상 추출.
+
+    sklearn 이 설치돼 있으면 KMeans, 없으면 평균 색 ×k 로 graceful degrade.
+    """
+    img = load_rgb(image_bytes)
+    pixels = img.reshape(-1, 3)
+    # 너무 큰 이미지는 다운샘플 (속도)
+    if pixels.shape[0] > 50000:
+        idx = np.random.default_rng(0).choice(pixels.shape[0], size=50000, replace=False)
+        pixels = pixels[idx]
+    try:
+        from sklearn.cluster import KMeans
+
+        km = KMeans(n_clusters=k, n_init=4, random_state=0).fit(pixels)
+        centers = km.cluster_centers_
+    except Exception:
+        centers = np.tile(pixels.mean(axis=0, keepdims=True), (k, 1))
+
+    def _to_hex(c):
+        r, g, b = (np.clip(c, 0, 1) * 255).astype(int).tolist()
+        return f"#{r:02X}{g:02X}{b:02X}"
+
+    return [_to_hex(c) for c in centers]
 
 
 # ---------- OKLCH 기반 5×10 명채도 타일 -----------------------------------------
@@ -332,6 +409,7 @@ def save_simulation_result(
     result_url: str | None = None,
     is_anonymous: bool | None = None,
     is_palette_public: bool | None = None,
+    subject_labels: list[str] | None = None,
 ):
     """프로젝트 + 팔레트 동시 저장 (기존 시그니처 보호 + 신규 키워드 인자).
 
@@ -342,11 +420,15 @@ def save_simulation_result(
       * `parent_id` 셀프 FK 는 본 함수에서는 NULL 이며, 수정/스크랩 흐름에서
         `save_snapshot()` / `scrap_project()` 가 채워준다.
       * `palettes` 는 projects 에 대해 ON DELETE CASCADE 이므로 별도 정리 불필요.
-      * `subject_id`, `illu_id` 는 RAG 추론 근거로서 별도 컬럼에 보존된다.
+      * `subject_id` = "대표 피사체" (멀티리전 시 첫 영역). 모든 영역 라벨은
+        `subject_labels` JSONB 배열로 함께 저장된다.
+      * `matrix_json` 은 멀티리전의 경우 재현 불가(마스크 미저장)이므로
+        디버그/감사 용도로만 유지한다.
     """
     data_to_insert = {
         "owner_id": user_id,
         "subject_id": subject_id,
+        "subject_labels": subject_labels,
         "illu_id": illu_id,
         "matrix_json": matrix,
         "origin_path": origin_url,
@@ -408,6 +490,12 @@ def save_snapshot(parent_project_id: str, matrix, origin_url, result_url, base_c
 SHARE_LOCK_DAYS = 30  # 공유 후 즉시 삭제 잠금 기간
 
 
+_PROJECT_SELECT = (
+    "id, owner_id, origin_path, result_path, scrap_count, created_at, status, "
+    "subject_id, subject_labels, illu_id, is_anonymous, is_palette_public"
+)
+
+
 def fetch_my_shared_projects(owner_id: str | None, limit: int = 20) -> list[dict]:
     """좌측 사이드바 — '내가 공유한' 라인업."""
     if not owner_id:
@@ -415,7 +503,7 @@ def fetch_my_shared_projects(owner_id: str | None, limit: int = 20) -> list[dict
     try:
         resp = (
             conn.table("projects")
-            .select("id, origin_path, result_path, scrap_count, created_at, status, subject_id, illu_id, is_anonymous")
+            .select(_PROJECT_SELECT)
             .eq("owner_id", owner_id)
             .order("created_at", desc=True)
             .limit(limit)
@@ -438,7 +526,7 @@ def fetch_others_shared_projects(owner_id: str | None, limit: int = 20) -> list[
         try:
             q = (
                 conn.table("projects")
-                .select("id, origin_path, result_path, scrap_count, created_at, status, subject_id, illu_id, is_anonymous")
+                .select(_PROJECT_SELECT)
                 .eq("is_anonymous", True)
                 .order("created_at", desc=True)
                 .limit(limit)
@@ -606,17 +694,49 @@ def render_original_image_panel() -> None:
 
 
 def render_tag_panel() -> None:
-    """중앙 하단: 피사체 / 광원 태그 탭 (각각 단일 선택)."""
+    """중앙 하단: 피사체(영역별 N개) / 광원(단일) 태그 탭."""
     st.markdown("**Tags**")
-    tabs = st.tabs(["🦆 피사체 (Subject · 50)", "💡 광원 (Illuminant · 5)"])
+    tabs = st.tabs(["🦆 피사체 영역 (Subject · N개)", "💡 광원 (Illuminant · 5)"])
     with tabs[0]:
-        _render_subject_tag_grid()
+        _render_region_panel()
     with tabs[1]:
         _render_illuminant_tag_grid()
-    st.caption("Orange: Selected · Gray: Not Selected")
+    st.caption("Orange: Selected · Gray: Not Selected · 같은 광원 아래 여러 영역에 다른 피사체를 매핑합니다.")
 
 
-def _render_subject_tag_grid() -> None:
+def _render_region_panel() -> None:
+    """영역(region) 리스트 관리 + 새 영역 추가 위젯.
+
+    영역 = {subject, mask, matrix}. 마스크는 휘발(DB 미저장).
+    """
+    regions: list[dict] = st.session_state.setdefault(SS_REGIONS, [])
+
+    # ─── 현재 영역 목록 ───
+    if regions:
+        st.markdown(f"**현재 영역: {len(regions)}개**")
+        for i, region in enumerate(list(regions)):
+            subj = region.get("subject") or {}
+            label = subj.get("label", "(unknown)")
+            mask = region.get("mask")
+            mask_info = (
+                f"{int(mask.sum())} px 칠해짐"
+                if mask is not None and np is not None
+                else "마스크 없음 → 전체 적용"
+            )
+            with st.expander(
+                f"#{i + 1} · {label}  ·  {mask_info}",
+                expanded=(i == len(regions) - 1),
+            ):
+                _render_mask_canvas_for_region(i, region)
+                if st.button("🗑️ 이 영역 삭제", key=f"del_region_{i}"):
+                    regions.pop(i)
+                    st.session_state[SS_REGIONS] = regions
+                    st.rerun()
+
+        st.divider()
+
+    # ─── 새 영역 추가 ───
+    st.markdown("**+ 새 영역의 피사체 선택**")
     q = st.text_input(
         "Tag Search",
         key="subject_search",
@@ -632,32 +752,91 @@ def _render_subject_tag_grid() -> None:
             or ql in (s.get("category") or "").lower()
         ]
 
-    sel = st.session_state.get(SS_SELECTED_SUBJECT) or {}
-    sel_id = sel.get("id")
-
     if not subjects:
         st.caption("_(피사체 데이터가 없습니다. reflectance_library 에 INSERT 가 필요합니다)_")
         return
 
+    used_ids = {(r.get("subject") or {}).get("id") for r in regions}
+
     cols = st.columns(4)
     for i, subj in enumerate(subjects):
         with cols[i % 4]:
-            is_sel = subj["id"] == sel_id
+            already_used = subj["id"] in used_ids
             label = subj["label"]
             if subj.get("is_uv_active"):
                 label = f"✦ {label}"
+            if already_used:
+                label = f"✓ {label}"
             if st.button(
                 label,
-                key=f"subj_{subj['id']}",
-                type=("primary" if is_sel else "secondary"),
+                key=f"add_region_{subj['id']}",
+                type=("primary" if already_used else "secondary"),
                 use_container_width=True,
+                help=("이미 영역으로 추가됨 — 다시 누르면 영역이 하나 더 생성됩니다." if already_used else None),
             ):
-                # 단일 선택 — 다시 클릭 시 토글 해제
-                if is_sel:
-                    st.session_state[SS_SELECTED_SUBJECT] = None
-                else:
-                    st.session_state[SS_SELECTED_SUBJECT] = subj
+                regions.append({"subject": subj, "mask": None, "matrix": None})
+                st.session_state[SS_REGIONS] = regions
                 st.rerun()
+
+
+def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
+    """영역별 drawable-canvas 마스크 위젯.
+
+    [좌표계 동기화 — 제일 흔한 버그]
+      * canvas 표시 크기 ≠ 실제 이미지(H×W) 이면 마스크가 어긋난다.
+      * 따라서 canvas 알파 채널을 `cv2.resize(..., (W, H), INTER_NEAREST)` 로 리사이즈.
+      * **boolean 마스크에 선형 보간을 쓰면 경계가 회색으로 뭉개진다 → 반드시 INTER_NEAREST.**
+    """
+    img_pil = st.session_state.get(SS_ORIGIN_IMAGE)
+    if img_pil is None:
+        st.caption("먼저 좌측 'Upload' 로 이미지를 업로드하세요.")
+        return
+    if cv2 is None or np is None:
+        st.warning("opencv-python-headless / numpy 가 필요합니다 (requirements 설치).")
+        return
+
+    try:
+        from streamlit_drawable_canvas import st_canvas
+    except Exception:
+        st.warning("`streamlit-drawable-canvas` 가 설치되지 않았습니다. (requirements 설치 필요)")
+        return
+
+    iw, ih = img_pil.size  # PIL: (W, H)
+    DISPLAY_W = 480
+    scale = DISPLAY_W / iw
+    disp_h = int(round(ih * scale))
+
+    stroke = st.slider(
+        "브러시 두께",
+        min_value=4,
+        max_value=80,
+        value=24,
+        key=f"stroke_{region_index}",
+    )
+
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 165, 0, 0.3)",
+        stroke_width=stroke,
+        stroke_color="#FFA500",
+        background_image=img_pil,
+        update_streamlit=True,
+        width=DISPLAY_W,
+        height=disp_h,
+        drawing_mode="freedraw",
+        key=f"canvas_region_{region_index}",
+    )
+
+    # canvas 알파 채널을 이진화 → 실제 이미지 좌표계로 INTER_NEAREST 리사이즈
+    if canvas_result is None or canvas_result.image_data is None:
+        return
+    raw_alpha = canvas_result.image_data[:, :, 3]
+    if raw_alpha.sum() == 0:
+        # 아직 안 칠함 — 마스크 없음 (None == 전체 적용)
+        region["mask"] = None
+        return
+    raw_mask = (raw_alpha > 0).astype(np.uint8)
+    mask_native = cv2.resize(raw_mask, (iw, ih), interpolation=cv2.INTER_NEAREST)
+    region["mask"] = mask_native.astype(bool)
 
 
 def _render_illuminant_tag_grid() -> None:
@@ -751,17 +930,20 @@ def render_action_buttons() -> None:
     st.write("")
 
     # ----- Convert (gated) -----
-    subj = st.session_state.get(SS_SELECTED_SUBJECT)
+    regions: list[dict] = st.session_state.get(SS_REGIONS) or []
     illu = st.session_state.get(SS_SELECTED_ILLU)
-    both_selected = bool(subj) and bool(illu)
     has_image = st.session_state.get(SS_ORIGIN_BYTES) is not None
+    has_region = len(regions) > 0
+    has_illu = bool(illu)
 
-    convert_disabled = not (both_selected and has_image)
+    convert_disabled = not (has_image and has_region and has_illu)
     convert_help = None
     if not has_image:
         convert_help = "먼저 이미지를 업로드하세요."
-    elif not both_selected:
-        convert_help = "피사체와 광원을 모두 선택하세요."
+    elif not has_region:
+        convert_help = "피사체 영역을 1개 이상 추가하세요."
+    elif not has_illu:
+        convert_help = "광원을 선택하세요."
 
     if st.button(
         "Convert",
@@ -770,7 +952,7 @@ def render_action_buttons() -> None:
         disabled=convert_disabled,
         help=convert_help,
     ):
-        _run_convert(subj, illu)
+        _run_convert_multi(regions, illu)
 
     st.write("")
 
@@ -782,44 +964,119 @@ def render_action_buttons() -> None:
         disabled=finish_disabled,
         help=("Convert 를 먼저 실행하세요." if finish_disabled else None),
     ):
-        # 현재 세션 상태를 모달에 전달하기 위해 가짜 project dict 를 합성
+        # 멀티리전: 첫 영역의 피사체를 "대표" 로 (subject_id 단일 컬럼용),
+        # 모든 영역 라벨은 subject_labels JSONB 컬럼으로 함께 저장.
+        rep_subj = (regions[0].get("subject") if regions else {}) or {}
+        labels = [
+            (r.get("subject") or {}).get("label")
+            for r in regions
+            if r.get("subject")
+        ]
+
         draft_project = {
             "id": None,  # 아직 INSERT 전
-            "subject_id": (subj or {}).get("id"),
+            "subject_id": rep_subj.get("id"),
             "illu_id": (illu or {}).get("id"),
+            "subject_labels": labels,
             "scrap_count": 0,
             "created_at": datetime.utcnow().isoformat() + "Z",
             "is_anonymous": st.session_state.get(SS_IS_ANON, False),
-            "_subject_label": (subj or {}).get("label"),
+            "_subject_label": rep_subj.get("label"),
             "_illu_name": (illu or {}).get("name"),
             "_base_colors": st.session_state.get(SS_BASE_COLORS) or [],
             "_origin_bytes": st.session_state.get(SS_ORIGIN_BYTES),
             "_result_bytes": st.session_state.get(SS_RESULT_BYTES),
             "_matrix": st.session_state.get(SS_MATRIX),
+            "_regions_meta": [
+                {
+                    "label": (r.get("subject") or {}).get("label"),
+                    "matrix": r.get("matrix"),
+                    "mask_px": (int(r["mask"].sum()) if r.get("mask") is not None and np is not None else None),
+                }
+                for r in regions
+            ],
         }
         show_project_modal(draft_project, mode="share")
 
 
-def _run_convert(subj: dict, illu: dict) -> None:
-    """Convert 버튼 핸들러 — RAG → GPT-4o-mini → numpy 변환 → 대표색 → 5×10."""
-    ctx = build_rag_context(subj, illu)
+def _run_convert_multi(regions: list[dict], illu: dict) -> None:
+    """멀티리전 Convert 핸들러.
+
+    [핵심 규칙]
+      * 광원은 1개 공통, 피사체는 영역별 N개.
+      * 시작점은 원본 이미지(`out = img.copy()`) → 안 칠한 영역은 자동으로 원본 유지.
+      * 마스크 겹침은 **last-write-wins** (루프 후순위가 덮어쓴다).
+      * 한 영역의 AI 응답이 스키마를 위반하면 그 영역만 `IDENTITY` 로 fallback,
+        나머지 영역은 정상 처리한다 (부분 실패 격리).
+      * 마스크는 절대 DB 에 저장하지 않는다 — session_state 안에서만 휘발.
+    """
+    origin_bytes = st.session_state.get(SS_ORIGIN_BYTES)
+    if not origin_bytes:
+        st.error("원본 이미지가 없습니다.")
+        return
+    if np is None:
+        st.error("numpy 가 필요합니다 (requirements 설치).")
+        return
+
+    img = load_rgb(origin_bytes)               # H×W×3 float32
+    out = img.copy()                            # 시작점 = 원본
+    matrices_for_session: list[dict] = []
+    fallback_count = 0
+
+    with st.spinner(f"GPT-4o-mini 호출 × {len(regions)} 영역…"):
+        for region in regions:
+            subj = region.get("subject") or {}
+            ctx = build_rag_context(subj, illu)
+            try:
+                matrix = call_gpt4o_mini_for_matrix(ctx)
+            except NotImplementedError:
+                st.info("PHASE 2: GPT-4o-mini 호출이 미구현 상태 → IDENTITY 로 진행합니다.")
+                matrix = IDENTITY
+            except Exception as e:
+                st.warning(f"AI 호출 실패 ({subj.get('label')}): {e} → IDENTITY 로 진행.")
+                matrix = IDENTITY
+
+            if not validate_matrix_payload(matrix):
+                matrix = IDENTITY
+                fallback_count += 1
+
+            region["matrix"] = matrix
+            matrices_for_session.append(matrix)
+
+            try:
+                transformed = apply_matrix_array(img, matrix)
+            except NotImplementedError:
+                st.error("PHASE 3 (numpy 변환) 의존성이 미설치 상태입니다.")
+                return
+
+            mask = region.get("mask")
+            if mask is None:
+                # 마스크 없음 = 전체 적용 (last-write-wins 규칙상 이전 영역을 덮음)
+                out = transformed
+            else:
+                # 마스크 영역만 덮어쓰기 — 안 칠한 부분은 그대로 유지
+                out[mask] = transformed[mask]
+
+    result_bytes = to_png_bytes(out)
+    st.session_state[SS_RESULT_BYTES] = result_bytes
+    # 대표 행렬은 첫 영역 (디버그/표시용) — 합성 결과 재현은 어차피 마스크 없이 불가
+    st.session_state[SS_MATRIX] = (
+        matrices_for_session[0] if matrices_for_session else IDENTITY
+    )
+
     try:
-        matrix = call_gpt4o_mini_for_matrix(ctx)
-        if not validate_matrix_payload(matrix):
-            st.error("⚠️ GPT-4o-mini 응답이 3x4 매트릭스 스키마를 위반했습니다.")
-            return
-        st.session_state[SS_MATRIX] = matrix
-
-        result_bytes = apply_matrix(st.session_state[SS_ORIGIN_BYTES], matrix)
-        st.session_state[SS_RESULT_BYTES] = result_bytes
-
         colors = extract_base_colors(result_bytes, k=5)
-        st.session_state[SS_BASE_COLORS] = colors
-        st.session_state[SS_TILE_GRID] = build_5x10_tile_grid(colors)
-        st.success("✅ 변환 완료")
-        st.rerun()
-    except NotImplementedError as e:
-        st.warning(f"{e}\n(스카폴딩 단계 — 실제 알고리즘은 PHASE 2/3 에서 채워집니다)")
+    except NotImplementedError:
+        colors = []
+    st.session_state[SS_BASE_COLORS] = colors
+    st.session_state[SS_TILE_GRID] = build_5x10_tile_grid(colors)
+
+    if fallback_count:
+        st.warning(
+            f"⚠️ {fallback_count}개 영역이 스키마 위반으로 IDENTITY fallback 처리됨."
+        )
+    st.success(f"✅ 변환 완료 · {len(regions)}개 영역 합성")
+    st.rerun()
 
 
 # ---------- 모달 (조회 / 공유 확정 — 같은 컴포넌트 재사용) ----------------------
@@ -866,14 +1123,24 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
 
     # ---- 메타: 태그 / 스크랩 수 / 공유일 / 제작자 ----
     meta_cols = st.columns(4)
+
+    # 피사체 = N개 라벨 배열 (멀티리전). 단일 라벨로 표시할 수 없으므로 join.
+    labels: list[str] = list(project.get("subject_labels") or [])
+    if not labels:
+        # back-compat: 구 단일 컬럼 fallback
+        if is_share and project.get("_subject_label"):
+            labels = [project["_subject_label"]]
+        elif project.get("subject_id"):
+            fallback = _lookup_label("reflectance_library", project["subject_id"])
+            labels = [fallback] if fallback else []
+    subj_display = ", ".join(labels) if labels else "—"
+
     if is_share:
-        subj_label = project.get("_subject_label")
         illu_name = project.get("_illu_name")
     else:
-        subj_label = _lookup_label("reflectance_library", project.get("subject_id"))
         illu_name = _lookup_label("standard_illuminants", project.get("illu_id"), name_col="name")
 
-    meta_cols[0].metric("피사체", subj_label or "—")
+    meta_cols[0].metric("피사체", subj_display)
     meta_cols[1].metric("광원", illu_name or "—")
     meta_cols[2].metric("스크랩", project.get("scrap_count", 0))
     meta_cols[3].metric(
@@ -920,6 +1187,7 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
                 origin_url=origin_url,
                 base_colors=project.get("_base_colors") or [],
                 subject_id=project.get("subject_id"),
+                subject_labels=project.get("subject_labels") or labels or None,
                 illu_id=project.get("illu_id"),
                 result_url=result_url,
                 is_anonymous=anon,
