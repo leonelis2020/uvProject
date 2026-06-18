@@ -30,9 +30,9 @@ streamlit run app.py
 | PHASE | 책임                                       | 핵심 함수 (위치)                                                                                            | 외부 의존성                  |
 | ----- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------- | ---------------------------- |
 | 0     | Supabase 연결 + 마스터 데이터              | `get_reflectance_data`, `get_illuminant_spd`, `list_subjects`, `list_illuminants`                           | `st_supabase_connection`     |
-| 1     | 이미지 업로드 (1024px 리사이즈)            | `handle_image_upload`                                                                                       | `Pillow`                     |
-| 2     | RAG + **GPT-4o-mini (텍스트 JSON 전용)**   | `build_rag_context`, `call_gpt4o_mini_for_matrix`, `validate_matrix_payload`                                | `openai`                     |
-| 3     | numpy 색변환 + **OKLCH 5×10 타일**         | `apply_matrix`, `extract_base_colors`, `make_shades`, `build_5x10_tile_grid`                                | `numpy`, `scikit-learn`, `coloraide` |
+| 1     | 이미지 업로드 (1024px) + **영역별 마스킹** | `handle_image_upload`, `_render_mask_canvas_for_region`                                                     | `Pillow`, `opencv-python-headless`, `streamlit-drawable-canvas` |
+| 2     | RAG + **GPT-4o-mini (텍스트 JSON 전용) × N영역** | `build_rag_context`, `call_gpt4o_mini_for_matrix`, `validate_matrix_payload`, `_run_convert_multi`     | `openai`                     |
+| 3     | numpy 색변환 (배열 in/out) + **OKLCH 5×10 타일** | `load_rgb`, `to_png_bytes`, `apply_matrix_array`, `apply_matrix`, `extract_base_colors`, `make_shades`, `build_5x10_tile_grid` | `numpy`, `scikit-learn`, `coloraide` |
 | 4     | Storage + DB INSERT (트랜잭션)             | `upload_to_storage`, `save_simulation_result`, `save_snapshot`                                              | `supabase`                   |
 | 5     | 갤러리 라인업 / 스크랩(익명 카운트) / 삭제 | `fetch_my_shared_projects`, `fetch_others_shared_projects`, `scrap_project`, `request_project_deletion`     | `supabase`                   |
 
@@ -51,8 +51,19 @@ streamlit run app.py
 └────────────────┘  └────────────────────────┘  └───────────────────┘  └───────────────────┘
 ```
 
-* **Convert 버튼**은 `이미지 업로드 + 피사체 선택 + 광원 선택` 셋이 모두 충족되어야 활성화된다 (`render_action_buttons` 참조).
+* **Convert 버튼**은 `이미지 업로드 + 피사체 영역 ≥ 1 + 광원 선택` 셋이 모두 충족되어야 활성화된다 (`render_action_buttons` 참조).
 * **모달**은 단일 컴포넌트 `show_project_modal(project, mode)` 를 `view` / `share` 두 모드로 재사용한다 (`@st.dialog`).
+
+### 멀티리전(영역별) 변환 규칙 — Phase 2 신규
+
+* **광원 1 + 피사체 N**: 사진 한 장은 한 조명 아래 찍힌 것이므로 `illu_id` 는 단일 유지. 피사체는 영역(region)마다 다르게 매핑.
+* **`SS_REGIONS`** = `list[{subject, mask, matrix}]` (session_state 단독 보유 — 마스크는 휘발).
+* **합성**: 영역마다 GPT-4o-mini 호출 → 행렬 검증 → `apply_matrix_array(img, M)` 결과를 `out[mask]` 로 덮어쓴다.
+  * 시작점은 원본(`out = img.copy()`) — **안 칠한 곳은 자동으로 원본 유지**.
+  * 마스크 겹침: **last-write-wins** (루프 후순위가 이긴다).
+  * **부분 실패 격리**: 한 영역이 스키마 위반이어도 IDENTITY 로 fallback → 나머지는 정상.
+* **DB**: 마스크는 절대 저장하지 않는다. 공유물 = 결과 이미지 + 5색 + `subject_labels` (JSONB 배열) + 메타.
+* **좌표계 동기화**: drawable-canvas 표시 크기 ≠ 이미지 H×W → 마스크는 반드시 `cv2.resize(..., (W,H), INTER_NEAREST)` 로 리사이즈. boolean 마스크에 선형 보간을 쓰면 경계가 회색으로 뭉개진다.
 
 ---
 
@@ -63,10 +74,12 @@ streamlit run app.py
 | `standard_illuminants`  | 광원 마스터                   | `name`, `spd_data (JSONB)`                                                        |
 | `reflectance_library`   | RAG 반사율 라이브러리         | `category`, `label`, `spectral_values (JSONB)`, `is_uv_active`                    |
 | `profiles`              | 사용자 (Supabase Auth 연동)   | `id`, `nickname`                                                                  |
-| `projects`              | 시뮬레이션 결과 + 메타        | `owner_id`, `parent_id (self FK)`, `subject_id (FK)`, `illu_id (FK)`, `matrix_json`, `status`, `scrap_count`, `is_anonymous`, `is_palette_public` |
+| `projects`              | 시뮬레이션 결과 + 메타        | `owner_id`, `parent_id (self FK)`, `subject_id (FK, 대표)`, `subject_labels (JSONB[])`, `illu_id (FK)`, `matrix_json`, `status`, `scrap_count`, `is_anonymous`, `is_palette_public` |
 | `palettes`              | 대표 5색 HEX                  | `project_id (FK CASCADE)`, `base_colors (JSONB)`                                  |
 
-> 📂 신규 컬럼 마이그레이션 SQL: [`sql/2026_06_18_add_subject_and_palette_public.sql`](sql/2026_06_18_add_subject_and_palette_public.sql)
+> 📂 마이그레이션 SQL:
+> - [`sql/2026_06_18_add_subject_and_palette_public.sql`](sql/2026_06_18_add_subject_and_palette_public.sql) — `subject_id` FK + `is_palette_public` + 인덱스 + `anon_gallery_view`
+> - [`sql/2026_06_18_add_subject_labels.sql`](sql/2026_06_18_add_subject_labels.sql) — `subject_labels JSONB` + `anon_gallery_view` 재정의
 
 > ❗ `palettes` 는 `projects` 에 대해 `ON DELETE CASCADE` 이므로 별도 정리 불필요.
 > ❗ `projects.parent_id` 는 셀프 FK — 수정 스냅샷 & 스크랩 복제 시 부모를 가리킨다.
