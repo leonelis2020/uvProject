@@ -1,4 +1,4 @@
-streamlit>=1.36.0
+streamlit>=1.36.0,<1.56.0
 st-supabase-connection>=1.2.1
 supabase>=2.5.0
 pillow>=10.3.0

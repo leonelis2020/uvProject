@@ -1,0 +1,6 @@
+# Streamlit secrets
+.streamlit/secrets.toml
+secrets.toml
+
+# 환경변수 파일도 같이
+.env
