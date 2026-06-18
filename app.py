@@ -48,40 +48,19 @@ except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
 
 
-# ── 호환성 shim: streamlit.elements.image.image_to_url ────────────────────────
-# `streamlit-drawable-canvas == 0.9.3` 은 Streamlit 내부의
-# `streamlit.elements.image.image_to_url` 에 의존한다. Streamlit 1.42 부근에서
-# 해당 함수가 다른 모듈로 옮겨졌기 때문에 신버전에서는 캔버스 호출 시
-# `AttributeError: module 'streamlit.elements.image' has no attribute 'image_to_url'`
-# 가 발생한다. 모듈 로드 시점에 신/구 경로를 모두 시도하여 가능하면 복구한다.
-# 실패해도 예외를 던지지 않으며, `_render_mask_canvas_for_region` 가 사각 영역
-# 슬라이더 폴백으로 자연스럽게 전환한다.
-def _patch_streamlit_image_to_url() -> bool:
-    try:
-        import streamlit.elements.image as _img_mod
-    except Exception:
-        return False
-    if hasattr(_img_mod, "image_to_url"):
-        return True
-    for module_path in (
-        "streamlit.elements.lib.image_utils",
-        "streamlit.elements.image_utils",
-    ):
-        try:
-            mod = __import__(module_path, fromlist=["image_to_url"])
-        except Exception:
-            continue
-        fn = getattr(mod, "image_to_url", None)
-        if fn is not None:
-            try:
-                _img_mod.image_to_url = fn  # type: ignore[attr-defined]
-                return True
-            except Exception:
-                continue
-    return False
-
-
-_STREAMLIT_CANVAS_COMPAT_OK = _patch_streamlit_image_to_url()
+# ── streamlit-drawable-canvas 호환성 정책 ─────────────────────────────────────
+# `streamlit-drawable-canvas == 0.9.3` 는 Streamlit 1.42 직전 기준으로 작성됐고,
+# 그 이후 Streamlit 이 `image_to_url` 의 시그니처(`width: int` → `layout_config`)
+# 를 바꿔서 두 가지 패턴 모두 깨진다:
+#   (a) 함수가 모듈에서 사라져 `AttributeError: ... has no attribute 'image_to_url'`
+#   (b) 함수는 찾아도 시그니처 불일치로 `AttributeError: 'int' has no attribute 'width'`
+# 이전 버전의 monkey-patch 는 (a) 만 막아주고 (b) 를 그대로 노출시키는 부작용이
+# 있었다 (시연 화면 → 모든 태그 클릭 시 트레이스백 + UI 흔들림).
+#
+# 결론: monkey-patch 를 **제거**하고, `_render_mask_canvas_for_region` 에서
+# `st_canvas` 호출을 **모든 예외에 대해** 받아 bbox 슬라이더 폴백으로 전환한다.
+# 마우스 freedraw 가 필요해지면 향후 별도 컴포넌트(custom HTML canvas 등) 로
+# 대체한다. 현재 UX 는 사각 영역 마스킹 + 멀티리전 합성으로 충분히 작동한다.
 
 # =============================================================================
 # PHASE 0: CONNECTION & MASTER LAYER
@@ -1158,17 +1137,11 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
             drawing_mode="freedraw",
             key=f"canvas_region_{region_index}",
         )
-    except AttributeError as exc:
-        if "image_to_url" in str(exc) or "streamlit.elements.image" in str(exc):
-            # Streamlit 신버전 비호환 — bbox 슬라이더 폴백.
-            _render_bbox_mask_fallback(region_index, region, img_pil)
-            return
-        raise
-    except Exception as exc:
-        st.warning(
-            f"`streamlit-drawable-canvas` 실행 중 오류가 발생했습니다: {exc}\n"
-            "사각 영역 슬라이더로 대체합니다."
-        )
+    except Exception:
+        # 어떤 예외든(AttributeError on image_to_url, TypeError on
+        # layout_config, RuntimeError 등) bbox 슬라이더 폴백으로 전환한다.
+        # 메시지를 trace 로 노출하지 않는 이유: 시연 중 매 rerun 마다 같은
+        # 트레이스가 영역마다 겹쳐 쌓여 UI 가 진동하는 현상을 막기 위함.
         _render_bbox_mask_fallback(region_index, region, img_pil)
         return
 
