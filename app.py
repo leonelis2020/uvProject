@@ -23,6 +23,7 @@ Fat-Client (Streamlit) + Thin-DB (Supabase) 스카폴딩.
 from __future__ import annotations
 
 import io
+import json
 import os
 import uuid
 from datetime import datetime, timedelta
@@ -69,6 +70,24 @@ conn = st.connection(
     url=s_url,
     key=s_key,
 )
+
+
+def _get_openai_key() -> str | None:
+    """OpenAI API 키 하이브리드 조회 — Supabase 자격 증명과 동일한 정책.
+
+    1순위: 환경 변수 `OPENAI_API_KEY` (배포 환경 / Codespaces 시크릿)
+    2순위: `.streamlit/secrets.toml` 의 `[openai] api_key = "..."`
+
+    프로세스가 시작될 때마다 조회되지 않고 매 호출마다 갱신을 허용한다
+    (Streamlit hot-reload 시 secrets 가 갱신될 수 있음).
+    """
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets["openai"]["api_key"]  # type: ignore[index]
+    except Exception:
+        return None
 
 
 # -----------------------------------------------------------------------------
@@ -227,22 +246,83 @@ def validate_matrix_payload(payload: Any) -> bool:
     return True
 
 
-def call_gpt4o_mini_for_matrix(rag_context: dict) -> dict:
+_MATRIX_SYSTEM_PROMPT = (
+    "You are a color-science assistant. Given a target subject's spectral reflectance "
+    "(typically 300–700 nm, 41 points, scaled 0–1) and an illuminant's spectral power "
+    "distribution (SPD), produce a 3x4 affine RGB color transformation matrix that "
+    "simulates how the subject would appear under the given illuminant when its UV/IR "
+    "reflectance is translated into the visible sRGB band.\n\n"
+    "Return STRICT JSON ONLY (no prose, no markdown fences) with this exact shape:\n"
+    '{"r":[r0,r1,r2,bias],"g":[g0,g1,g2,bias],"b":[b0,b1,b2,bias]}\n\n'
+    "All twelve values are floats in [-2.0, 2.0]. The matrix is applied to the "
+    "homogeneous pixel vector [r, g, b, 1] in sRGB float [0, 1] as out = M @ [r,g,b,1]. "
+    "If you have low confidence, return values close to the identity matrix "
+    "(diagonals ≈ 1, off-diagonals ≈ 0, bias ≈ 0)."
+)
+
+
+def call_gpt4o_mini_for_matrix(
+    rag_context: dict,
+    *,
+    max_retries: int = 1,
+    temperature: float = 0.2,
+) -> dict:
     """GPT-4o-mini 호출 → 3x4 변환 행렬 JSON. **이미지는 전달하지 않는다.**
 
-    NOTE (PHASE 2 확장 지점):
-      * `from openai import OpenAI`
-      * `client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or st.secrets["openai"]["api_key"])`
-      * `client.chat.completions.create(`
-            `model="gpt-4o-mini",`
-            `response_format={"type":"json_object"},`
-            `messages=[{"role":"system","content": SYSTEM_PROMPT},`
-            `          {"role":"user","content": json.dumps(rag_context)}])`
-      * 반환 직후 반드시 `validate_matrix_payload()` 로 검증하고,
-        실패 시 1회 retry → 그래도 실패하면 항등행렬을 fallback 으로 반환.
+    Flow:
+      1. env-var → secrets.toml 하이브리드로 OPENAI_API_KEY 조회.
+      2. RAG context 를 `_MATRIX_SYSTEM_PROMPT` + JSON 사용자 메시지로 합성.
+      3. `response_format={"type":"json_object"}` 로 강제 JSON 응답.
+      4. `validate_matrix_payload()` 통과 시 즉시 반환.
+      5. 실패 시 최대 `max_retries` 회 재시도 (temperature 동일).
+      6. 끝까지 실패하면 IDENTITY 를 반환 (예외를 던지지 않음 →
+         `_run_convert_multi` 의 부분 실패 격리 정책과 일관).
     """
-    # TODO[PHASE-2]: 실제 OpenAI 호출 구현 (gpt-4o-mini, JSON-only, 텍스트 입력)
-    raise NotImplementedError("PHASE 2: GPT-4o-mini 호출 로직 미구현 (스카폴딩 슬롯)")
+    api_key = _get_openai_key()
+    if not api_key:
+        # 환경/시크릿 모두 비어 있으면 IDENTITY 로 graceful degrade.
+        # (시연용 RLS 정책과 동일한 톤 — 키 없이도 앱이 꺾이지 않게)
+        return dict(IDENTITY)
+
+    try:
+        from openai import OpenAI
+    except Exception:
+        return dict(IDENTITY)
+
+    client = OpenAI(api_key=api_key)
+    user_payload = {
+        "subject": rag_context.get("subject"),
+        "illuminant": rag_context.get("illuminant"),
+    }
+
+    for _attempt in range(max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": _MATRIX_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(user_payload, ensure_ascii=False),
+                    },
+                ],
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            if not content:
+                continue
+            payload = json.loads(content)
+            if validate_matrix_payload(payload):
+                return payload
+        except json.JSONDecodeError:
+            continue
+        except Exception:
+            # 네트워크 / 레이트리밋 / 인증 등 — 다음 시도 또는 fallback
+            continue
+
+    # 모든 시도 실패 → IDENTITY (멀티리전 합성에서 그 영역만 변환 없이 진행)
+    return dict(IDENTITY)
 
 
 # Backward-compat alias — 기존에 이미지 인자를 받던 시그니처가 코드 어딘가에 박혀있을 수
@@ -391,11 +471,61 @@ def ensure_authenticated() -> dict | None:
     return st.session_state.get(SS_AUTH_USER)
 
 
-def upload_to_storage(bucket: str, path: str, data: bytes) -> str:
-    """Supabase Storage 업로드 후 public URL (또는 signed URL) 반환."""
-    # TODO[PHASE-4]: conn.client.storage.from_(bucket).upload(path, data)
-    # TODO[PHASE-4]: return conn.client.storage.from_(bucket).get_public_url(path)
-    raise NotImplementedError("PHASE 4: Storage 업로드 미구현 (스카폴딩 슬롯)")
+def _resolve_storage():
+    """`st_supabase_connection` 내부의 supabase-py Storage 클라이언트를 안전하게 추출.
+
+    버전에 따라 `conn.client` / `conn._client` / `conn.session` 중 노출 위치가
+    다를 수 있으므로 방어적으로 탐색한다.
+    """
+    for attr in ("client", "_client", "session", "supabase_client"):
+        candidate = getattr(conn, attr, None)
+        storage = getattr(candidate, "storage", None) if candidate is not None else None
+        if storage is not None:
+            return storage
+    # 마지막 시도: conn 자체가 storage 속성을 직접 노출하는 경우
+    storage = getattr(conn, "storage", None)
+    if storage is not None:
+        return storage
+    raise RuntimeError(
+        "Supabase Storage 클라이언트를 찾을 수 없습니다. "
+        "st_supabase_connection 버전을 확인하세요."
+    )
+
+
+def upload_to_storage(
+    bucket: str,
+    path: str,
+    data: bytes,
+    *,
+    content_type: str = "image/png",
+) -> str:
+    """Supabase Storage 업로드 후 public URL 반환.
+
+    경로 스킴: 호출자가 `f"{uuid}/origin.png"` 형태로 unique key 를 만들어 넘긴다.
+    같은 키로 두 번 호출돼도 `upsert=true` 로 덮어쓴다 (수정/재시도 안전).
+
+    Args:
+        bucket: Supabase Storage 버킷 이름 (예: `originals`, `results`).
+        path:   버킷 내부 경로 (UUID 기반 유니크 키).
+        data:   업로드할 바이너리.
+        content_type: MIME — 기본 image/png. JPEG 등으로 호출 가능.
+
+    Returns:
+        public URL 문자열. (private 버킷이라면 호출 측에서 signed URL 로 교체)
+    """
+    storage = _resolve_storage()
+    bucket_api = storage.from_(bucket)
+    # supabase-py v2: upload(path, file=..., file_options={...})
+    try:
+        bucket_api.upload(
+            path=path,
+            file=data,
+            file_options={"content-type": content_type, "upsert": "true"},
+        )
+    except TypeError:
+        # 구버전 supabase-py 호환 — positional 시그니처
+        bucket_api.upload(path, data, {"content-type": content_type, "upsert": "true"})
+    return bucket_api.get_public_url(path)
 
 
 def save_simulation_result(
@@ -471,12 +601,23 @@ def save_simulation_result(
 def save_snapshot(parent_project_id: str, matrix, origin_url, result_url, base_colors) -> str | None:
     """기존 프로젝트의 수정본을 새 row 로 INSERT (스냅샷).
 
-    [참조 무결성]
-      * 기존 row 를 UPDATE 하지 않고 새 row 를 INSERT 한 뒤 `parent_id` 로 부모를
-        가리킨다. 갤러리/히스토리는 parent_id 그래프를 따라간다.
+    [의도적으로 Phase 2 범위 외]
+      * Phase 2 멀티리전 사양은 **마스크를 DB에 저장하지 않는다**. 따라서 합성
+        결과를 정확히 재현할 수 없어 "원본을 편집해 새 버전을 만든다" 라는
+        스냅샷 의미가 약해진다 (cursor 작업 지시: "재현/편집 안 할 거라 과한
+        정규화는 불필요").
+      * `scrap_project` 가 익명 카운트만 +1 하는 것으로 Phase 2 의 모든
+        '재공유' UX 를 흡수한다. 따라서 본 함수는 현재 호출되지 않는다.
+      * 향후 마스크 직렬화 정책이 결정되면 본 함수를 살려서:
+          - parent_id = parent_project_id 로 새 projects row INSERT
+          - 동일 palettes row 복제 (또는 base_colors 만 새로 저장)
+          - 그래프 형태 히스토리(`parent_id` 셀프 FK) 유지
+        형태로 구현한다.
     """
-    # TODO[PHASE-4]: save_simulation_result 와 유사하나 parent_id 필드 추가
-    raise NotImplementedError("PHASE 4: 스냅샷 INSERT 미구현 (스카폴딩 슬롯)")
+    raise NotImplementedError(
+        "save_snapshot 은 Phase 2 범위 외 — 마스크 미저장 정책상 재현 불가 "
+        "(필요해질 때 활성화)."
+    )
 
 
 # =============================================================================
@@ -1042,16 +1183,16 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
             subj = region.get("subject") or {}
             ctx = build_rag_context(subj, illu)
             try:
+                # call_gpt4o_mini_for_matrix 는 키 부재/네트워크 오류 시
+                # 예외를 던지지 않고 IDENTITY 를 반환한다. 따라서 여기서는
+                # 진짜 예외(런타임 에러)만 잡아내면 충분하다.
                 matrix = call_gpt4o_mini_for_matrix(ctx)
-            except NotImplementedError:
-                st.info("PHASE 2: GPT-4o-mini 호출이 미구현 상태 → IDENTITY 로 진행합니다.")
-                matrix = IDENTITY
-            except Exception as e:
+            except Exception as e:  # pragma: no cover - defensive
                 st.warning(f"AI 호출 실패 ({subj.get('label')}): {e} → IDENTITY 로 진행.")
-                matrix = IDENTITY
+                matrix = dict(IDENTITY)
 
             if not validate_matrix_payload(matrix):
-                matrix = IDENTITY
+                matrix = dict(IDENTITY)
                 fallback_count += 1
 
             region["matrix"] = matrix
@@ -1191,9 +1332,40 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
         ):
             st.session_state[SS_IS_ANON] = anon
             st.session_state[SS_IS_PALETTE_PUBLIC] = pal_pub
-            # TODO[PHASE-4]: upload_to_storage 로 원본/결과 업로드 → URL 획득
-            origin_url = "https://example.com/origin.png"
-            result_url = "https://example.com/result.png"
+
+            # ── 원본/결과 이미지를 Supabase Storage 에 업로드 ────────────────
+            #   /originals/{uuid}/origin.png
+            #   /results/{uuid}/result.png
+            # 같은 UUID 를 prefix 로 묶어 한 프로젝트의 원본↔결과 매핑을 보존한다.
+            doc_uuid = str(uuid.uuid4())
+            origin_bytes = project.get("_origin_bytes")
+            result_bytes = project.get("_result_bytes")
+
+            origin_url: str | None = None
+            result_url: str | None = None
+            if origin_bytes:
+                try:
+                    origin_url = upload_to_storage(
+                        BUCKET_ORIGINALS,
+                        f"{doc_uuid}/origin.png",
+                        origin_bytes,
+                    )
+                except Exception as e:
+                    st.warning(f"원본 Storage 업로드 실패: {e}")
+            if result_bytes:
+                try:
+                    result_url = upload_to_storage(
+                        BUCKET_RESULTS,
+                        f"{doc_uuid}/result.png",
+                        result_bytes,
+                    )
+                except Exception as e:
+                    st.warning(f"결과 Storage 업로드 실패: {e}")
+
+            if not origin_url:
+                # origin_path 컬럼은 NOT NULL 이므로 최소한 placeholder 라도 채운다.
+                origin_url = f"local://{doc_uuid}/origin.png"
+
             user = ensure_authenticated() or {}
             msg = save_simulation_result(
                 user_id=user.get("id"),
