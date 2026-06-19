@@ -1461,38 +1461,41 @@ def fetch_palette_for_project(project_id: str) -> list[str]:
 
 
 def scrap_project(source_project_id: str, current_scrap_count: int = 0) -> str:
-    """타인의 프로젝트를 스크랩 — do_scrap RPC 호출.
+    """타인의 프로젝트를 스크랩 — scraps 테이블 직접 INSERT.
 
-    [비즈니스 규칙]
-      * scraps 테이블에 (user_id, project_id) 로 기록 → 중복 스크랩 방지.
-      * 처음 스크랩할 때만 scrap_count += 1 (이미 했으면 카운트 안 오름).
-      * 동시에 '내가 스크랩한 것' 보관함의 근거가 된다.
+    [구조]
+      * RPC(do_scrap) 호출이 환경에 따라 auth.uid() 를 못 받는 케이스가 있어
+        이 함수에서 user_id 를 명시적으로 전달하며 직접 INSERT 한다.
+      * (user_id, project_id) UNIQUE 제약으로 중복 시 예외 발생 → 카운트 안 오름.
+      * 처음 INSERT 성공 시에만 projects.scrap_count += 1.
     """
+    user = ensure_authenticated() or {}
+    uid = user.get("id")
+    if not uid:
+        return "❌ 로그인이 필요합니다."
+
+    # 1) scraps 테이블에 (user_id, project_id) 직접 INSERT
     try:
-        resp = conn.rpc("do_scrap", {"p_project_id": source_project_id}).execute()
-        result = resp.data if hasattr(resp, "data") else None
-        # rpc 반환은 보통 문자열 그대로 또는 리스트로 옴
-        if isinstance(result, list) and result:
-            result = result[0]
-        if result == "OK":
-            return "✅ 스크랩 완료 — 내 보관함에 저장됐습니다."
-        if result == "ALREADY_SCRAPPED":
-            return "ℹ️ 이미 스크랩한 프로젝트입니다."
-        if result == "NOT_LOGGED_IN":
-            return "❌ 로그인이 필요합니다."
-        return "✅ 스크랩 완료."
+        conn.table("scraps").insert(
+            {"user_id": uid, "project_id": source_project_id}
+        ).execute()
     except Exception as e:
-        # RPC 미설치(함수 없음) 시 구버전 폴백 — 단순 +1 (중복 방지 없음)
         msg = str(e)
-        if "do_scrap" in msg or "function" in msg.lower():
-            try:
-                conn.table("projects").update(
-                    {"scrap_count": (current_scrap_count or 0) + 1}
-                ).eq("id", source_project_id).execute()
-                return "✅ 스크랩 완료 (구버전 — SQL의 do_scrap 함수 설치 권장)."
-            except Exception as e2:
-                return f"❌ 스크랩 실패: {e2}"
+        # UNIQUE 위반 = 이미 스크랩한 것 → 카운트 안 올림
+        if "duplicate" in msg.lower() or "23505" in msg or "unique" in msg.lower():
+            return "ℹ️ 이미 스크랩한 프로젝트입니다."
         return f"❌ 스크랩 실패: {e}"
+
+    # 2) 처음 스크랩이면 projects.scrap_count 증가
+    try:
+        conn.table("projects").update(
+            {"scrap_count": (current_scrap_count or 0) + 1}
+        ).eq("id", source_project_id).execute()
+    except Exception:
+        # 카운트 갱신 실패해도 스크랩 자체는 됐으니 성공으로 처리
+        pass
+
+    return "✅ 스크랩 완료 — 내 보관함에 저장됐습니다."
 
 
 def fetch_my_scrapped_projects(user_id: str | None, limit: int = 20) -> list[dict]:
