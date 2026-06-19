@@ -1444,20 +1444,70 @@ def fetch_palette_for_project(project_id: str) -> list[str]:
         return []
 
 
-def scrap_project(source_project_id: str, current_scrap_count: int) -> str:
-    """타인의 프로젝트를 스크랩 — 익명 카운트만 +1.
+def scrap_project(source_project_id: str, current_scrap_count: int = 0) -> str:
+    """타인의 프로젝트를 스크랩 — do_scrap RPC 호출.
 
     [비즈니스 규칙]
-      * 누가 스크랩했는지는 추적하지 않는다 (요구사항: "인원수만").
-      * 원본 status 가 'Pending_Deletion' 이면 스크랩 불가 (UI 단에서 버튼 비활성).
+      * scraps 테이블에 (user_id, project_id) 로 기록 → 중복 스크랩 방지.
+      * 처음 스크랩할 때만 scrap_count += 1 (이미 했으면 카운트 안 오름).
+      * 동시에 '내가 스크랩한 것' 보관함의 근거가 된다.
     """
     try:
-        conn.table("projects").update(
-            {"scrap_count": (current_scrap_count or 0) + 1}
-        ).eq("id", source_project_id).execute()
-        return "✅ 스크랩 완료 (익명 카운트 +1)"
+        resp = conn.rpc("do_scrap", {"p_project_id": source_project_id}).execute()
+        result = resp.data if hasattr(resp, "data") else None
+        # rpc 반환은 보통 문자열 그대로 또는 리스트로 옴
+        if isinstance(result, list) and result:
+            result = result[0]
+        if result == "OK":
+            return "✅ 스크랩 완료 — 내 보관함에 저장됐습니다."
+        if result == "ALREADY_SCRAPPED":
+            return "ℹ️ 이미 스크랩한 프로젝트입니다."
+        if result == "NOT_LOGGED_IN":
+            return "❌ 로그인이 필요합니다."
+        return "✅ 스크랩 완료."
     except Exception as e:
+        # RPC 미설치(함수 없음) 시 구버전 폴백 — 단순 +1 (중복 방지 없음)
+        msg = str(e)
+        if "do_scrap" in msg or "function" in msg.lower():
+            try:
+                conn.table("projects").update(
+                    {"scrap_count": (current_scrap_count or 0) + 1}
+                ).eq("id", source_project_id).execute()
+                return "✅ 스크랩 완료 (구버전 — SQL의 do_scrap 함수 설치 권장)."
+            except Exception as e2:
+                return f"❌ 스크랩 실패: {e2}"
         return f"❌ 스크랩 실패: {e}"
+
+
+def fetch_my_scrapped_projects(user_id: str | None, limit: int = 20) -> list[dict]:
+    """'내가 스크랩한' 프로젝트 목록 — scraps 조인.
+
+    남이 공유한 것(둘러보기) 과 구분되는, 내가 직접 담은 보관함.
+    """
+    if not user_id:
+        return []
+    try:
+        # 내 스크랩의 project_id 목록
+        sc = (
+            conn.table("scraps")
+            .select("project_id")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        pids = [r["project_id"] for r in (sc.data or []) if r.get("project_id")]
+        if not pids:
+            return []
+        resp = (
+            conn.table("projects")
+            .select(_PROJECT_SELECT)
+            .in_("id", pids)
+            .execute()
+        )
+        return resp.data or []
+    except Exception:
+        return []
 
 
 def request_project_deletion(project_id: str, created_at_iso: str, scrap_count: int) -> str:
@@ -1516,6 +1566,15 @@ def render_sidebar() -> None:
                 fetch_my_shared_projects(user.get("id"), limit=10),
                 key_prefix="mine",
             )
+            st.divider()
+
+            # 내가 스크랩(저장)한 것 — 남이 공유한 것과 명확히 구분되는 보관함
+            st.caption("📌 내가 스크랩한 보관함")
+            scrapped = fetch_my_scrapped_projects(user.get("id"), limit=10)
+            if scrapped:
+                _render_lineup(scrapped, key_prefix="scrap")
+            else:
+                st.caption("_(아직 스크랩한 항목이 없습니다)_")
             st.divider()
 
         st.caption("내가 공유받은(남이 공유한) 미리보기")
@@ -2520,7 +2579,17 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
         (project.get("created_at") or "")[:10] or "—",
     )
 
-    creator = "익명의 창작자" if project.get("is_anonymous") else (project.get("owner_id") or "—")
+    if project.get("is_anonymous"):
+        creator = "익명의 창작자"
+    else:
+        # owner_id(UUID) 대신 profiles.nickname 표시. 뷰가 있으면 이미 들어있고,
+        # 없으면 owner_id 로 profiles 조회. 둘 다 실패하면 UUID 앞부분만.
+        creator = project.get("owner_nickname")
+        if not creator:
+            creator = _lookup_nickname(project.get("owner_id"))
+        if not creator:
+            oid = project.get("owner_id") or ""
+            creator = (oid[:8] + "…") if oid else "—"
     st.caption(f"제작자: {creator}")
 
     # ---- 모드별 추가 액션 ----
@@ -2622,6 +2691,26 @@ def _lookup_label(table: str, row_id: str | None, name_col: str = "label") -> st
         )
         if resp.data:
             return resp.data[0].get(name_col)
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _lookup_nickname(owner_id: str | None) -> str | None:
+    """owner_id(UUID) → profiles.nickname. 제작자 표시용 (UUID 노출 방지)."""
+    if not owner_id:
+        return None
+    try:
+        resp = (
+            conn.table("profiles")
+            .select("id, nickname")
+            .eq("id", owner_id)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            return resp.data[0].get("nickname")
     except Exception:
         pass
     return None
