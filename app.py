@@ -427,11 +427,22 @@ def apply_false_color_array(
     img: "np.ndarray",
     target_rgb,
     strength: float = 1.0,
+    mode: str = "iridescent",
+    sat_boost: float = 7.0,
 ) -> "np.ndarray":
-    """H×W×3 [0,1] 원본을 target_rgb 색조로 리컬러. 원본 luma(명암 디테일) 보존.
+    """H×W×3 [0,1] 원본을 false-color 로 변환. 두 가지 모드.
 
-    멀티리전 합성에서 영역마다 target_rgb / strength 를 바꿔 반복 호출한다.
-    `apply_matrix_array` 의 대체 단위 함수 (배열 in/out).
+    mode="flat":
+        원본 luma(밝기) × 단일 target 색. 영역이 한 색으로 균일하게 물든다.
+        (광원 색조를 평평하게 입히고 싶을 때.)
+
+    mode="iridescent" (기본):
+        '무지개 까마귀' 모드. 원본 픽셀의 미세한 색편차(구조색 광택)를 분리·증폭해
+        부위마다 파랑/보라/청록이 다르게 나타나는 영롱한 결과를 만든다. 까마귀처럼
+        검은 깃털의 미묘한 광택이 위치에 따라 다른 색으로 펼쳐진다.
+        sat_boost 가 클수록 무지개가 강해진다.
+
+    멀티리전 합성에서 영역마다 target_rgb / strength / mode 를 바꿔 반복 호출한다.
     """
     if np is None:
         raise NotImplementedError("numpy 미설치")
@@ -439,7 +450,21 @@ def apply_false_color_array(
     luma = (
         0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
     )[..., None]
-    recolored = np.clip(luma * target * 1.6, 0.0, 1.0)  # ×1.6: luma×tint 어두움 보정
+
+    if mode == "flat":
+        recolored = np.clip(luma * target * 1.6, 0.0, 1.0)
+    else:  # iridescent
+        # 1) 무채색(밝기) 제거 → 픽셀별 미세 색편차(구조색)만 남김
+        chroma = img - luma
+        # 2) 색편차 증폭 → 미묘한 광택을 큰 색차로
+        amp = chroma * sat_boost
+        # 3) false-color 축으로 채널 시프트 (UV쪽 = 파랑/보라/청록 계열로)
+        #    원래 G편차→R, B편차→G, R편차→B  (가시 구조색을 UV 무지개로 회전)
+        irid = np.stack([amp[..., 1], amp[..., 2], amp[..., 0]], axis=-1)
+        # 4) 어두운 베이스(target 색조로 물든 밝기) + 무지개 광택 합성
+        base = luma * target * 0.85
+        recolored = np.clip(base + irid * 0.6, 0.0, 1.0)
+
     out = img * (1.0 - strength) + recolored * strength
     return np.clip(out, 0.0, 1.0).astype(np.float32)
 
@@ -1633,6 +1658,32 @@ def _render_region_panel() -> None:
                 f"#{i + 1} · {label}  ·  {mask_info}",
                 expanded=(i == len(regions) - 1),
             ):
+                # ── 변환 스타일: 무지개(구조색) vs 단색 ──
+                style = st.radio(
+                    "변환 스타일",
+                    options=["무지개 (구조색 광택)", "단색 (광원 색조)"],
+                    index=0 if region.get("irid_mode", "iridescent") == "iridescent" else 1,
+                    key=f"irid_mode_radio_{i}",
+                    horizontal=True,
+                    help=(
+                        "무지개: 까마귀 깃털처럼 부위별로 파랑/보라/청록이 다르게 "
+                        "나타나는 영롱한 효과. 단색: 광원 색조를 평평하게 입힘."
+                    ),
+                )
+                region["irid_mode"] = (
+                    "iridescent" if style.startswith("무지개") else "flat"
+                )
+                if region["irid_mode"] == "iridescent":
+                    region["irid_boost"] = st.slider(
+                        "무지개 강도",
+                        min_value=2.0,
+                        max_value=14.0,
+                        value=float(region.get("irid_boost", 7.0)),
+                        step=0.5,
+                        key=f"irid_boost_{i}",
+                        help="클수록 색이 더 강하게 펼쳐집니다.",
+                    )
+
                 _render_mask_canvas_for_region(i, region)
                 if st.button("🗑️ 이 영역 삭제", key=f"del_region_{i}"):
                     regions.pop(i)
@@ -2107,7 +2158,11 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
 
             try:
                 transformed = apply_false_color_array(
-                    img, target["rgb"], strength=1.0
+                    img,
+                    target["rgb"],
+                    strength=1.0,
+                    mode=region.get("irid_mode", "iridescent"),
+                    sat_boost=float(region.get("irid_boost", 7.0)),
                 )
             except NotImplementedError:
                 st.error("PHASE 3 (numpy 변환) 의존성이 미설치 상태입니다.")
