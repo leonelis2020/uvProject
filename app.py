@@ -48,6 +48,18 @@ except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
 
 
+# ── set_page_config 는 모든 Streamlit 명령보다 먼저 실행돼야 한다 ─────────────
+# 아래의 `conn = st.connection(...)` / `st.error(...)` 등 모듈 레벨 Streamlit
+# 호출이 있어서, `main()` 안에 두면 "set_page_config can only be called once
+# per app" 에러가 나거나 새 codespace 에서 앱이 안 열리는 일이 있다 (사용자
+# 보고). 모듈 최상단으로 끌어올린다.
+st.set_page_config(
+    page_title="UV 모사 팔레트 연구실",
+    page_icon="🎨",
+    layout="wide",
+)
+
+
 # ── Streamlit 버전 호환 헬퍼 ──────────────────────────────────────────────────
 # Streamlit 의 width 관련 API 가 두 번 deprecate 됐다:
 #   * `use_column_width=True`     : ~1.32 이전 표준 → 1.32+ 에서 deprecated
@@ -337,18 +349,105 @@ def validate_matrix_payload(payload: Any) -> bool:
 
 
 _MATRIX_SYSTEM_PROMPT = (
-    "You are a color-science assistant. Given a target subject's spectral reflectance "
-    "(typically 300–700 nm, 41 points, scaled 0–1) and an illuminant's spectral power "
-    "distribution (SPD), produce a 3x4 affine RGB color transformation matrix that "
-    "simulates how the subject would appear under the given illuminant when its UV/IR "
-    "reflectance is translated into the visible sRGB band.\n\n"
+    "You are a color-science assistant performing UV / non-standard illumination "
+    "photography simulation. Input per request:\n"
+    "- subject: spectral reflectance over 300–700 nm (~41 points, 0–1), plus an "
+    "  `is_uv_active` flag — TRUE means the subject fluoresces under UV light.\n"
+    "- illuminant: spectral power distribution (SPD) of the light source plus a "
+    "  human-readable `name` such as 'UV-A', 'Sunrise', 'D65'.\n\n"
+    "Compute a 3x4 affine RGB matrix M that, when applied as "
+    "`out = M @ [r, g, b, 1.0]` to each pixel of an ordinary daylight photo of the "
+    "subject, SIMULATES how it would appear under the supplied illuminant.\n\n"
+    "Concrete scenario behaviour you MUST follow:\n\n"
+    "1. UV-A 'black light' (illuminant.name == 'UV-A' OR SPD dominated by 300–400 nm "
+    "   with little 400–700 nm energy):\n"
+    "   * Drastically REDUCE the visible-band response — diagonals around 0.10–0.35, "
+    "     NOT 1.0. The scene should look much darker than daylight.\n"
+    "   * Apply a strong VIOLET / DEEP-BLUE cast: blue channel coefficients should "
+    "     dominate (b row roughly [0.10, 0.15, 0.85, 0.10]) and red/green should "
+    "     contribute partial blue via cross-channel terms (r row roughly "
+    "     [0.20, 0.05, 0.30, 0.05], g row roughly [0.05, 0.20, 0.25, 0.05]).\n"
+    "   * If subject is_uv_active=TRUE, add a positive bias to whichever visible "
+    "     channel approximates the subject's fluorescence emission (typically GREEN "
+    "     or RED bias around +0.10–0.20) so painted regions visibly POP.\n\n"
+    "2. Sunrise / Sunset (warm SPD heavy in 580–700 nm):\n"
+    "   * Boost red, slightly boost green, suppress blue. Example: r ≈ "
+    "     [1.25, 0.10, 0.00, 0.08], g ≈ [0.05, 0.95, 0.00, 0.02], b ≈ "
+    "     [0.00, 0.00, 0.55, -0.05].\n\n"
+    "3. D65 standard daylight: stays close to identity but slightly cooler — "
+    "   diagonals near 0.95–1.05, not exactly 1.0.\n\n"
+    "HARD RULES (violation = failure):\n"
+    "- You MUST NOT return the exact identity matrix "
+    '{"r":[1,0,0,0],"g":[0,1,0,0],"b":[0,0,1,0]}. That value is reserved as the '
+    "calling code's 'unknown' fallback and would render the original photo "
+    "unchanged.\n"
+    "- Make a physically-motivated estimate even with limited data. Bias toward a "
+    "visibly noticeable transformation: a slightly wrong but visible result is "
+    "preferable to a perfect-but-invisible one.\n\n"
     "Return STRICT JSON ONLY (no prose, no markdown fences) with this exact shape:\n"
     '{"r":[r0,r1,r2,bias],"g":[g0,g1,g2,bias],"b":[b0,b1,b2,bias]}\n\n'
-    "All twelve values are floats in [-2.0, 2.0]. The matrix is applied to the "
-    "homogeneous pixel vector [r, g, b, 1] in sRGB float [0, 1] as out = M @ [r,g,b,1]. "
-    "If you have low confidence, return values close to the identity matrix "
-    "(diagonals ≈ 1, off-diagonals ≈ 0, bias ≈ 0)."
+    "All twelve values are floats in [-2.0, 2.0]."
 )
+
+
+# 결정론적 illuminant 폴백 — AI 가 identity 만 뱉을 때 시각적 변화를 보장하기 위함.
+# 이름을 lower() 비교하므로 'uv-a', 'UV-A', 'uva' 모두 매칭.
+_ILLUMINANT_FALLBACK_MATRICES: dict[str, dict] = {
+    "uv-a": {
+        # Black light 가상 — 어둡고 보랏빛, 마젠타 풍의 결과.
+        "r": [0.20, 0.05, 0.30, 0.05],
+        "g": [0.05, 0.20, 0.25, 0.05],
+        "b": [0.10, 0.15, 0.85, 0.10],
+    },
+    "sunrise": {
+        # 일출 — 따뜻한 오렌지 캐스트.
+        "r": [1.25, 0.10, 0.00, 0.08],
+        "g": [0.05, 0.95, 0.00, 0.02],
+        "b": [0.00, 0.00, 0.55, -0.05],
+    },
+    "sunset": {
+        # 일몰 — 일출보다 더 붉음.
+        "r": [1.35, 0.12, 0.00, 0.12],
+        "g": [0.08, 0.88, 0.00, 0.00],
+        "b": [0.00, 0.00, 0.45, -0.10],
+    },
+    "d65": {
+        # 표준 주광 — 거의 동등하지만 살짝 cooler. (완벽한 항등을 피한다)
+        "r": [0.95, 0.00, 0.05, 0.00],
+        "g": [0.00, 1.00, 0.00, 0.00],
+        "b": [0.00, 0.00, 1.05, 0.00],
+    },
+}
+
+
+def _illuminant_fallback(illu_name: str | None) -> dict:
+    """illuminant 이름 기반 결정론적 행렬. 매칭 실패 시 약한 violet bias 반환.
+
+    `call_gpt4o_mini_for_matrix` 의 최종 폴백 — IDENTITY 를 직접 반환하지 않고
+    이걸 호출하면 사용자에게 '아무것도 안 바뀜' 보다는 시각적 단서가 남는다.
+    """
+    key = (illu_name or "").strip().lower()
+    if key in _ILLUMINANT_FALLBACK_MATRICES:
+        return dict(_ILLUMINANT_FALLBACK_MATRICES[key])
+    # 알 수 없는 illuminant — 미약한 cool/violet 캐스트 (식별 가능한 변화)
+    return {
+        "r": [0.85, 0.00, 0.10, 0.00],
+        "g": [0.00, 0.90, 0.05, 0.00],
+        "b": [0.05, 0.05, 1.00, 0.05],
+    }
+
+
+def _is_exact_identity(payload: dict) -> bool:
+    """payload 가 정확히 IDENTITY 행렬인지 (AI 가 hedging 으로 안전한 답을
+    내놓은 케이스를 거르기 위함)."""
+    try:
+        return (
+            list(payload.get("r", [])) == [1.0, 0.0, 0.0, 0.0]
+            and list(payload.get("g", [])) == [0.0, 1.0, 0.0, 0.0]
+            and list(payload.get("b", [])) == [0.0, 0.0, 1.0, 0.0]
+        )
+    except Exception:
+        return False
 
 
 def _record_openai_diag(**kv) -> None:
@@ -362,8 +461,8 @@ def _record_openai_diag(**kv) -> None:
 def call_gpt4o_mini_for_matrix(
     rag_context: dict,
     *,
-    max_retries: int = 1,
-    temperature: float = 0.2,
+    max_retries: int = 2,
+    temperature: float = 0.3,
 ) -> dict:
     """GPT-4o-mini 호출 → 3x4 변환 행렬 JSON. **이미지는 전달하지 않는다.**
 
@@ -440,18 +539,26 @@ def call_gpt4o_mini_for_matrix(
                 last_err = "empty response content"
                 continue
             payload = json.loads(content)
-            if validate_matrix_payload(payload):
-                _record_openai_diag(
-                    stage="ok",
-                    ok=True,
-                    detail=(
-                        f"매트릭스 수신 OK (시도 {attempt + 1}/{max_retries + 1})"
-                    ),
-                    raw_preview=last_raw,
-                    model="gpt-4o-mini",
-                )
-                return payload
-            last_err = "schema validation failed"
+            if not validate_matrix_payload(payload):
+                last_err = "schema validation failed"
+                continue
+            # ─── 모델이 안전책으로 IDENTITY 만 뱉었으면 거부하고 재시도. ──
+            # 시스템 프롬프트가 명시적으로 금지하지만 gpt-4o-mini 가 종종
+            # 무시한다. validate 단계에서 한 번 더 거른다.
+            if _is_exact_identity(payload):
+                last_err = "model returned exact identity (rejected)"
+                last_raw = content[:200]
+                continue
+            _record_openai_diag(
+                stage="ok",
+                ok=True,
+                detail=(
+                    f"매트릭스 수신 OK (시도 {attempt + 1}/{max_retries + 1})"
+                ),
+                raw_preview=last_raw,
+                model="gpt-4o-mini",
+            )
+            return payload
         except json.JSONDecodeError as e:
             last_err = f"json decode: {e}"
             continue
@@ -460,16 +567,23 @@ def call_gpt4o_mini_for_matrix(
             last_err = f"{type(e).__name__}: {e}"
             continue
 
+    # ─── 모든 시도가 실패하거나 IDENTITY 만 받았다면 결정론적 폴백 ────────
+    # IDENTITY 를 그대로 반환하면 결과 이미지가 원본과 100% 동일해 사용자가
+    # "AI 가 정말 호출됐나" 를 판단할 수 없다. illuminant 이름 기반 합리적
+    # 행렬을 반환해 시각적 단서를 남긴다.
+    illu_name = (rag_context.get("illuminant") or {}).get("name")
+    fallback = _illuminant_fallback(illu_name)
     _record_openai_diag(
         stage="failed",
         ok=False,
         detail=(
-            f"모든 시도 실패 (총 {max_retries + 1}회). 마지막 에러: {last_err}"
+            f"모든 시도 실패 (총 {max_retries + 1}회). 마지막 에러: {last_err}. "
+            f"illuminant='{illu_name}' 기반 결정론적 폴백 사용."
         ),
         raw_preview=last_raw,
         model="gpt-4o-mini",
     )
-    return dict(IDENTITY)
+    return fallback
 
 
 # Backward-compat alias — 기존에 이미지 인자를 받던 시그니처가 코드 어딘가에 박혀있을 수
@@ -1466,12 +1580,13 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
             drawing_mode="freedraw",
             key=f"canvas_region_{region_index}",
         )
-    except Exception:
-        # 어떤 예외든(AttributeError on image_to_url, TypeError on
-        # layout_config, RuntimeError 등) bbox 슬라이더 폴백으로 전환한다.
-        # 메시지를 trace 로 노출하지 않는 이유: 시연 중 매 rerun 마다 같은
-        # 트레이스가 영역마다 겹쳐 쌓여 UI 가 진동하는 현상을 막기 위함.
-        _render_bbox_mask_fallback(region_index, region, img_pil)
+    except Exception as exc:
+        # 어떤 예외든 bbox 슬라이더 폴백으로 전환한다. 이전엔 예외를 완전히
+        # 숨겼는데, 그 결과 사용자가 "왜 캔버스가 안 보이지?" 를 진단할 방법이
+        # 없었다. 폴백 안에 접힌 진단 expander 로 streamlit / canvas 버전과
+        # 실제 예외를 노출한다 (rerun 누적 노이즈는 expander 가 접혀 있어
+        # 발생하지 않음).
+        _render_bbox_mask_fallback(region_index, region, img_pil, canvas_error=exc)
         return
 
     # canvas 알파 채널을 이진화 → 실제 이미지 좌표계로 INTER_NEAREST 리사이즈
@@ -1487,7 +1602,13 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
     region["mask"] = mask_native.astype(bool)
 
 
-def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None:
+def _render_bbox_mask_fallback(
+    region_index: int,
+    region: dict,
+    img_pil,
+    *,
+    canvas_error: Exception | None = None,
+) -> None:
     """캔버스 마우스 트래킹이 동작하지 않을 때의 사각 영역 마스크 UI.
 
     4개 슬라이더 (left / right / top / bottom %) 로 사각 영역을 지정하고,
@@ -1552,6 +1673,31 @@ def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None
         f"마스크 영역: {(x2 - x1)}% × {(y2 - y1)}%  "
         f"({px2 - px1} × {py2 - py1} px = {int(mask.sum())} 픽셀)"
     )
+
+    # ── 캔버스가 왜 폴백됐는지 진단 (접힌 채로 — 노이즈 X, 필요 시 펼침) ──
+    with st.expander("🔧 캔버스 진단 (왜 슬라이더로 폴백?)", expanded=False):
+        st.code(f"streamlit:                 {st.__version__}", language="text")
+        try:
+            import streamlit_drawable_canvas as _sdc  # type: ignore
+            sdc_ver = getattr(_sdc, "__version__", "(unknown)")
+            st.code(f"streamlit-drawable-canvas: {sdc_ver}", language="text")
+        except Exception as e:
+            st.code(
+                f"streamlit-drawable-canvas: import 실패 — "
+                f"{type(e).__name__}: {e}",
+                language="text",
+            )
+        if canvas_error is not None:
+            st.code(
+                f"canvas 호출 예외:           "
+                f"{type(canvas_error).__name__}: {canvas_error}",
+                language="text",
+            )
+        st.caption(
+            "freedraw 가 되려면 `streamlit==1.41.1` 이 설치돼 있어야 합니다. "
+            "위 버전이 1.41.x 가 아니면 `pip install --upgrade --force-reinstall "
+            "-r requirements.txt` 를 실행하세요."
+        )
 
 
 def _render_illuminant_tag_grid() -> None:
@@ -2062,7 +2208,7 @@ def _lookup_label(table: str, row_id: str | None, name_col: str = "label") -> st
 # =============================================================================
 
 def main() -> None:
-    st.set_page_config(page_title="UV 모사 팔레트 연구실", page_icon="🎨", layout="wide")
+    # NOTE: st.set_page_config() 는 모듈 최상단에서 한 번만 호출 (중복 호출 금지)
     st.title("🎨 UV 모사 팔레트 연구실")
 
     render_sidebar()
