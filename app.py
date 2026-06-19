@@ -1626,12 +1626,24 @@ def _render_lineup(items: list[dict], key_prefix: str) -> None:
                         unsafe_allow_html=True,
                     )
                 st.caption(f"palette {len(colors)}color")
+                # 카드 제목: 피사체 라벨(있으면) + 광원 이름으로 의미있게 표시.
+                # (별도 title 컬럼 없이 기존 데이터로 라벨링)
+                _labels = proj.get("subject_labels") or []
+                _title = (
+                    (_labels[0] if _labels else None)
+                    or proj.get("_subject_label")
+                    or "프로젝트"
+                )
+                _created = (proj.get("created_at") or "")[:10]
                 if st.button(
-                    "Palette Title",
+                    f"{_title} · {_created}" if _created else _title,
                     key=f"{key_prefix}_open_{proj['id']}",
                     **_FW,
                 ):
-                    show_project_modal(proj, mode="view")
+                    try:
+                        show_project_modal(proj, mode="view")
+                    except Exception as e:
+                        st.error(f"미리보기 오류: {type(e).__name__}: {e}")
 
 
 # ---------- 중앙: 원본 이미지 + 태그 패널 ---------------------------------------
@@ -2434,11 +2446,30 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
     left, right = st.columns([1, 1])
     with left:
         st.markdown("**원본 이미지**")
+        shown = False
         if is_share and project.get("_origin_bytes"):
-            st.image(project["_origin_bytes"], **_FW)
+            try:
+                st.image(project["_origin_bytes"], **_FW)
+                shown = True
+            except Exception:
+                shown = False
         elif project.get("origin_path"):
-            st.image(project["origin_path"], **_FW)
-        else:
+            op = project["origin_path"]
+            # local:// placeholder 는 실제 파일이 아니므로 st.image 가 터진다.
+            # (Storage 버킷 미설정 시 저장된 가짜 경로) → 안내 문구로 대체.
+            if isinstance(op, str) and op.startswith("local://"):
+                st.info(
+                    "이미지가 클라우드(Storage)에 업로드되지 않았습니다. "
+                    "Supabase Storage 에 'originals'·'results' 버킷(Public)을 "
+                    "만들면 이미지가 표시됩니다."
+                )
+            else:
+                try:
+                    st.image(op, **_FW)
+                    shown = True
+                except Exception:
+                    st.caption("(이미지를 불러올 수 없습니다)")
+        if not shown and not (project.get("origin_path") or project.get("_origin_bytes")):
             st.caption("(원본 이미지 없음)")
 
     with right:
