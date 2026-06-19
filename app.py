@@ -223,11 +223,16 @@ def get_illuminant_spd(name: str) -> dict | None:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def list_subjects() -> list[dict]:
-    """피사체 50종 전체 목록 (중앙 태그 탭에서 사용)."""
+    """피사체 50종 전체 목록 (중앙 태그 탭에서 사용).
+
+    [버그픽스] false-color 변환은 spectral_values(분광 반사율) 가 반드시 필요한데,
+    과거엔 SELECT 에서 빠져 있어 변환이 무력화됐다(AI 방식은 name 만 써서 안 걸림).
+    spectral_values 를 함께 가져온다.
+    """
     try:
         resp = (
             conn.table("reflectance_library")
-            .select("id, category, label, is_uv_active")
+            .select("id, category, label, is_uv_active, spectral_values")
             .order("category")
             .order("label")
             .execute()
@@ -239,11 +244,16 @@ def list_subjects() -> list[dict]:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def list_illuminants() -> list[dict]:
-    """광원 5종 전체 목록."""
+    """광원 5종 전체 목록.
+
+    [버그픽스] false-color 변환은 spd_data(분광 전력 분포) 가 반드시 필요한데,
+    과거엔 SELECT 에서 빠져 있어 선택된 광원에 spd_data 가 없어 변환이 무력화됐다.
+    spd_data 를 함께 가져온다.
+    """
     try:
         resp = (
             conn.table("standard_illuminants")
-            .select("id, name, description")
+            .select("id, name, description, spd_data")
             .order("name")
             .execute()
         )
