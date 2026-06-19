@@ -1297,7 +1297,29 @@ def save_simulation_result(
     # None 값은 DB default 로 위임 (NOT NULL 컬럼 보호)
     data_to_insert = {k: v for k, v in data_to_insert.items() if v is not None}
 
-    project_resp = conn.table("projects").insert(data_to_insert).execute()
+    # ── DB 스키마에 일부 컬럼(subject_labels 등)이 없을 수 있다(PGRST204).
+    #    그 경우 누락 컬럼만 빼고 재시도해 '저장 자체가 통째로 실패'하는 것을 막는다.
+    def _insert_with_column_fallback(table_name: str, payload: dict):
+        attempt = dict(payload)
+        for _ in range(len(payload) + 1):
+            try:
+                return conn.table(table_name).insert(attempt).execute()
+            except Exception as e:
+                msg = str(e)
+                # PGRST204: "Could not find the 'X' column" → 그 컬럼 제거 후 재시도
+                if "PGRST204" in msg or "Could not find the" in msg:
+                    import re
+                    m = re.search(r"find the '([^']+)' column", msg)
+                    if m and m.group(1) in attempt:
+                        attempt.pop(m.group(1), None)
+                        continue
+                raise
+        return conn.table(table_name).insert(attempt).execute()
+
+    try:
+        project_resp = _insert_with_column_fallback("projects", data_to_insert)
+    except Exception as e:
+        return f"❌ 저장 실패 (projects INSERT): {type(e).__name__}: {e}"
 
     if project_resp.data:
         try:
@@ -1307,9 +1329,15 @@ def save_simulation_result(
                 else project_resp.data
             )
             p_id = row["id"]
-            conn.table("palettes").insert(
-                {"project_id": p_id, "base_colors": base_colors}
-            ).execute()
+            try:
+                conn.table("palettes").insert(
+                    {"project_id": p_id, "base_colors": base_colors}
+                ).execute()
+            except Exception as e:
+                return (
+                    f"✅ 프로젝트는 저장됨 (ID: {p_id}). "
+                    f"단, 팔레트 저장 실패: {type(e).__name__}"
+                )
             return f"✅ DB 저장 성공! (ID: {p_id})"
         except Exception:
             return "✅ DB 저장은 성공했으나, 화면 표시 중 작은 오류가 발생했습니다. (DB 확인 요망)"
