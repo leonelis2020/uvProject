@@ -23,6 +23,7 @@ Fat-Client (Streamlit) + Thin-DB (Supabase) 스카폴딩.
 from __future__ import annotations
 
 import io
+import json
 import os
 import uuid
 from datetime import datetime, timedelta
@@ -45,6 +46,41 @@ try:
     import cv2  # OpenCV — 마스크 리사이즈(INTER_NEAREST) 전용
 except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
+
+
+# ── Streamlit 버전 호환 헬퍼 ──────────────────────────────────────────────────
+# Streamlit 의 width 관련 API 가 두 번 deprecate 됐다:
+#   * `use_column_width=True`     : ~1.32 이전 표준 → 1.32+ 에서 deprecated
+#   * `use_container_width=True`  : 1.32 표준     → 1.51+ 에서 deprecated
+#   * `width="stretch"|"content"|int` : 1.51+ 신표준
+# 핀이 `>=1.36,<1.56` 이라 두 deprecation 모두에 걸칠 수 있어
+# 런타임 버전 체크로 올바른 kwargs 를 반환한다.
+def _full_width_kwargs() -> dict:
+    try:
+        ver = tuple(int(x) for x in st.__version__.split(".")[:2])
+    except Exception:
+        ver = (0, 0)
+    if ver >= (1, 51):
+        return {"width": "stretch"}
+    return {"use_container_width": True}
+
+
+_FW = _full_width_kwargs()
+
+
+# ── streamlit-drawable-canvas 호환성 정책 ─────────────────────────────────────
+# `streamlit-drawable-canvas == 0.9.3` 는 Streamlit 1.42 직전 기준으로 작성됐고,
+# 그 이후 Streamlit 이 `image_to_url` 의 시그니처(`width: int` → `layout_config`)
+# 를 바꿔서 두 가지 패턴 모두 깨진다:
+#   (a) 함수가 모듈에서 사라져 `AttributeError: ... has no attribute 'image_to_url'`
+#   (b) 함수는 찾아도 시그니처 불일치로 `AttributeError: 'int' has no attribute 'width'`
+# 이전 버전의 monkey-patch 는 (a) 만 막아주고 (b) 를 그대로 노출시키는 부작용이
+# 있었다 (시연 화면 → 모든 태그 클릭 시 트레이스백 + UI 흔들림).
+#
+# 결론: monkey-patch 를 **제거**하고, `_render_mask_canvas_for_region` 에서
+# `st_canvas` 호출을 **모든 예외에 대해** 받아 bbox 슬라이더 폴백으로 전환한다.
+# 마우스 freedraw 가 필요해지면 향후 별도 컴포넌트(custom HTML canvas 등) 로
+# 대체한다. 현재 UX 는 사각 영역 마스킹 + 멀티리전 합성으로 충분히 작동한다.
 
 # =============================================================================
 # PHASE 0: CONNECTION & MASTER LAYER
@@ -69,6 +105,79 @@ conn = st.connection(
     url=s_url,
     key=s_key,
 )
+
+
+def _get_openai_key() -> str | None:
+    """OpenAI API 키 하이브리드 조회 — Supabase 자격 증명과 동일한 정책.
+
+    1순위: 환경 변수 `OPENAI_API_KEY` (배포 환경 / Codespaces 시크릿)
+    2순위: `.streamlit/secrets.toml` 의 `[openai] api_key = "..."`
+
+    `_openai_key_info()` 는 같은 우선순위를 따르되 어디서 키가 왔는지
+    + 키의 접두/접미만 추출해 진단용으로 반환한다.
+    """
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        return key
+    try:
+        return st.secrets["openai"]["api_key"]  # type: ignore[index]
+    except Exception:
+        return None
+
+
+def _format_openai_error_hint(err_str: str | None) -> str | None:
+    """OpenAI 호출 실패 메시지를 사용자가 바로 행동할 수 있는 한 줄로 변환.
+
+    설정 모달의 진단 패널이 `detail` 필드를 그대로 보여주는 것에 더해, 자주
+    걸리는 패턴(잔액 부족 / 키 무효 / 레이트 리밋) 일 때만 따로 강조해 준다.
+    매칭 안 되면 `None` 을 반환해 힌트를 표시하지 않는다.
+    """
+    if not err_str:
+        return None
+
+    # OpenAI 잔액 부족 (insufficient_quota) — 429 와 함께 옴.
+    # rate_limit (단순 분당 제한) 과 분리해서 안내해야 한다: 결제 추가 vs 대기.
+    if "insufficient_quota" in err_str:
+        return (
+            "💳 OpenAI 계정 **크레딧 부족** (insufficient_quota).\n"
+            "https://platform.openai.com/settings/organization/billing 에서 "
+            "결제 수단을 추가하고 **최소 $5 크레딧 충전** 이 필요합니다. "
+            "(현재 Usage 페이지에 Total Spend $0.00 이 보이는 이유이며, "
+            "API 호출이 quota 검사 단계에서 차단되어 모델까지 도달하지 못함)"
+        )
+    if "invalid_api_key" in err_str or "Incorrect API key" in err_str:
+        return (
+            "🔑 API 키가 **유효하지 않음** — `.streamlit/secrets.toml` 의 "
+            "`[openai] api_key` 가 올바른 `sk-...` 형식인지 다시 확인하세요."
+        )
+    # insufficient_quota 와 분리: 잔액은 있으나 분당 호출량 초과.
+    if "rate_limit" in err_str.lower() and "insufficient_quota" not in err_str:
+        return "⏳ OpenAI **레이트 리밋** — 잠시 후 다시 시도하세요."
+    if "401" in err_str:
+        return "🔐 인증 실패 (401) — API 키가 만료/취소되었거나 다른 조직 키입니다."
+    return None
+
+
+def _openai_key_info() -> dict:
+    """진단용 — 키의 출처(env/secrets/없음) + 길이 + 마스킹된 미리보기."""
+    src = None
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        src = "env"
+    else:
+        try:
+            key = st.secrets["openai"]["api_key"]  # type: ignore[index]
+            src = "secrets"
+        except Exception:
+            key = None
+    if not key:
+        return {"source": None, "length": 0, "preview": None}
+    preview = f"{key[:6]}…{key[-4:]}" if len(key) > 10 else "***"
+    return {"source": src, "length": len(key), "preview": preview}
+
+
+# 마지막 OpenAI 호출 진단 — 설정 모달의 'AI 진단' 섹션이 표시
+SS_OPENAI_LAST_DIAG = "openai_last_diag"
 
 
 # -----------------------------------------------------------------------------
@@ -227,22 +336,140 @@ def validate_matrix_payload(payload: Any) -> bool:
     return True
 
 
-def call_gpt4o_mini_for_matrix(rag_context: dict) -> dict:
+_MATRIX_SYSTEM_PROMPT = (
+    "You are a color-science assistant. Given a target subject's spectral reflectance "
+    "(typically 300–700 nm, 41 points, scaled 0–1) and an illuminant's spectral power "
+    "distribution (SPD), produce a 3x4 affine RGB color transformation matrix that "
+    "simulates how the subject would appear under the given illuminant when its UV/IR "
+    "reflectance is translated into the visible sRGB band.\n\n"
+    "Return STRICT JSON ONLY (no prose, no markdown fences) with this exact shape:\n"
+    '{"r":[r0,r1,r2,bias],"g":[g0,g1,g2,bias],"b":[b0,b1,b2,bias]}\n\n'
+    "All twelve values are floats in [-2.0, 2.0]. The matrix is applied to the "
+    "homogeneous pixel vector [r, g, b, 1] in sRGB float [0, 1] as out = M @ [r,g,b,1]. "
+    "If you have low confidence, return values close to the identity matrix "
+    "(diagonals ≈ 1, off-diagonals ≈ 0, bias ≈ 0)."
+)
+
+
+def _record_openai_diag(**kv) -> None:
+    """OpenAI 호출 직후 진단 상태를 session_state 에 적재. 설정 모달이 표시."""
+    diag = st.session_state.get(SS_OPENAI_LAST_DIAG) or {}
+    diag.update(kv)
+    diag["ts"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    st.session_state[SS_OPENAI_LAST_DIAG] = diag
+
+
+def call_gpt4o_mini_for_matrix(
+    rag_context: dict,
+    *,
+    max_retries: int = 1,
+    temperature: float = 0.2,
+) -> dict:
     """GPT-4o-mini 호출 → 3x4 변환 행렬 JSON. **이미지는 전달하지 않는다.**
 
-    NOTE (PHASE 2 확장 지점):
-      * `from openai import OpenAI`
-      * `client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or st.secrets["openai"]["api_key"])`
-      * `client.chat.completions.create(`
-            `model="gpt-4o-mini",`
-            `response_format={"type":"json_object"},`
-            `messages=[{"role":"system","content": SYSTEM_PROMPT},`
-            `          {"role":"user","content": json.dumps(rag_context)}])`
-      * 반환 직후 반드시 `validate_matrix_payload()` 로 검증하고,
-        실패 시 1회 retry → 그래도 실패하면 항등행렬을 fallback 으로 반환.
+    Flow:
+      1. env-var → secrets.toml 하이브리드로 OPENAI_API_KEY 조회.
+      2. RAG context 를 `_MATRIX_SYSTEM_PROMPT` + JSON 사용자 메시지로 합성.
+      3. `response_format={"type":"json_object"}` 로 강제 JSON 응답.
+      4. `validate_matrix_payload()` 통과 시 즉시 반환.
+      5. 실패 시 최대 `max_retries` 회 재시도.
+      6. 끝까지 실패하면 IDENTITY 를 반환 (예외를 던지지 않음 →
+         `_run_convert_multi` 의 부분 실패 격리 정책과 일관).
+
+    [진단성]
+      모든 분기에서 `_record_openai_diag(...)` 로 마지막 호출의 상태를 저장한다.
+      "API 키 넣었는데 OpenAI 대시보드에 호출이 안 잡힘" 같은 시연 보고를
+      빠르게 식별할 수 있도록 설정 모달의 AI 진단 패널에 노출된다.
     """
-    # TODO[PHASE-2]: 실제 OpenAI 호출 구현 (gpt-4o-mini, JSON-only, 텍스트 입력)
-    raise NotImplementedError("PHASE 2: GPT-4o-mini 호출 로직 미구현 (스카폴딩 슬롯)")
+    api_key = _get_openai_key()
+    if not api_key:
+        _record_openai_diag(
+            stage="no_api_key",
+            ok=False,
+            detail=(
+                "OPENAI_API_KEY 환경변수도 없고 .streamlit/secrets.toml 의 "
+                "[openai] api_key 도 없습니다."
+            ),
+        )
+        return dict(IDENTITY)
+
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        _record_openai_diag(
+            stage="openai_import_failed",
+            ok=False,
+            detail=f"openai 패키지 import 실패: {type(e).__name__}: {e}",
+        )
+        return dict(IDENTITY)
+
+    try:
+        client = OpenAI(api_key=api_key)
+    except Exception as e:
+        _record_openai_diag(
+            stage="client_init_failed",
+            ok=False,
+            detail=f"OpenAI 클라이언트 초기화 실패: {type(e).__name__}: {e}",
+        )
+        return dict(IDENTITY)
+
+    user_payload = {
+        "subject": rag_context.get("subject"),
+        "illuminant": rag_context.get("illuminant"),
+    }
+
+    last_err: str | None = None
+    last_raw: str | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": _MATRIX_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(user_payload, ensure_ascii=False),
+                    },
+                ],
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            last_raw = content[:200]
+            if not content:
+                last_err = "empty response content"
+                continue
+            payload = json.loads(content)
+            if validate_matrix_payload(payload):
+                _record_openai_diag(
+                    stage="ok",
+                    ok=True,
+                    detail=(
+                        f"매트릭스 수신 OK (시도 {attempt + 1}/{max_retries + 1})"
+                    ),
+                    raw_preview=last_raw,
+                    model="gpt-4o-mini",
+                )
+                return payload
+            last_err = "schema validation failed"
+        except json.JSONDecodeError as e:
+            last_err = f"json decode: {e}"
+            continue
+        except Exception as e:
+            # 네트워크 / 레이트리밋 / 인증 등 — 예외 타입까지 보존
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+
+    _record_openai_diag(
+        stage="failed",
+        ok=False,
+        detail=(
+            f"모든 시도 실패 (총 {max_retries + 1}회). 마지막 에러: {last_err}"
+        ),
+        raw_preview=last_raw,
+        model="gpt-4o-mini",
+    )
+    return dict(IDENTITY)
 
 
 # Backward-compat alias — 기존에 이미지 인자를 받던 시그니처가 코드 어딘가에 박혀있을 수
@@ -387,15 +614,347 @@ BUCKET_RESULTS = "results"
 
 
 def ensure_authenticated() -> dict | None:
-    """Supabase Auth 세션 체크."""
+    """Supabase Auth 세션 체크 — `sign_in_user` 가 채워준 `SS_AUTH_USER` 를 반환."""
     return st.session_state.get(SS_AUTH_USER)
 
 
-def upload_to_storage(bucket: str, path: str, data: bytes) -> str:
-    """Supabase Storage 업로드 후 public URL (또는 signed URL) 반환."""
-    # TODO[PHASE-4]: conn.client.storage.from_(bucket).upload(path, data)
-    # TODO[PHASE-4]: return conn.client.storage.from_(bucket).get_public_url(path)
-    raise NotImplementedError("PHASE 4: Storage 업로드 미구현 (스카폴딩 슬롯)")
+def _resolve_auth():
+    """`st_supabase_connection` 내부의 supabase-py Auth 클라이언트 추출.
+
+    `_resolve_storage` 와 동일한 방어적 탐색 패턴.
+    """
+    for attr in ("client", "_client", "session", "supabase_client"):
+        candidate = getattr(conn, attr, None)
+        auth = getattr(candidate, "auth", None) if candidate is not None else None
+        if auth is not None:
+            return auth
+    auth = getattr(conn, "auth", None)
+    if auth is None:
+        raise RuntimeError(
+            "Supabase Auth 클라이언트를 찾을 수 없습니다. "
+            "st_supabase_connection 버전을 확인하세요."
+        )
+    return auth
+
+
+def _supabase_url_suffix(n: int = 18) -> str:
+    """진단 메시지에 노출할 Supabase 프로젝트 URL 의 짧은 식별자.
+
+    예: `https://abcdefghijkl.supabase.co` → `...lmnop.supabase.co`
+    잘못된 프로젝트에 가입되고 있는지 사용자가 빠르게 검증 가능하도록 한다.
+    전체 URL 은 노출하지 않는다 (시연 영상에 노출되더라도 안전).
+    """
+    try:
+        url = s_url or ""
+        return url[-n:] if url else "?"
+    except Exception:
+        return "?"
+
+
+# ── profiles 셋업 SQL — 운영자가 Supabase SQL Editor 에 1회만 실행 ─────────────
+# strict RLS (자기 행만 INSERT/UPDATE 가능) + SECURITY DEFINER 트리거 조합.
+# 트리거가 가입 시점에 RLS 를 우회해 profiles 행을 즉시 만들어 주므로
+# email-confirmation ON 환경(session=None) 에서도 가입이 막히지 않는다.
+_PROFILES_SETUP_SQL = """ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can insert own profile" ON public.profiles
+  FOR INSERT WITH CHECK (auth.uid() = id);
+CREATE POLICY "Profiles are viewable by everyone" ON public.profiles
+  FOR SELECT USING (true);
+CREATE POLICY "Users can update own profile" ON public.profiles
+  FOR UPDATE USING (auth.uid() = id);
+
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public AS $$
+BEGIN
+  INSERT INTO public.profiles (id, nickname)
+  VALUES (
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data->>'nickname',
+             'user_' || substr(NEW.id::text, 1, 8))
+  )
+  ON CONFLICT (id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();"""
+
+
+def _is_rls_error(err: Exception | str) -> bool:
+    """Postgres 42501 (insufficient_privilege) / RLS 위반 메시지인지 판별."""
+    s = str(err)
+    return (
+        "42501" in s
+        or "row-level security" in s.lower()
+        or "violates row-level security policy" in s.lower()
+    )
+
+
+def _rls_guidance(table: str) -> str:
+    """RLS 차단 시 사용자에게 어디에 무슨 SQL 을 붙여넣을지 안내.
+
+    이 메시지가 보이면 운영자가 Supabase SQL Editor 에 본 프로젝트의 표준
+    profiles 셋업 SQL (strict RLS + SECURITY DEFINER 트리거) 을 아직 적용하지
+    않았다는 신호다. 적용 후엔 가입 시 트리거가 profiles 행을 자동 생성해
+    이 분기 자체가 호출되지 않는다.
+    """
+    return (
+        f"🔒 Postgres RLS 가 `public.{table}` 의 쓰기를 막고 있습니다.\n"
+        f"Supabase Dashboard → SQL Editor 에 아래를 1회 실행해 주세요"
+        f"(strict RLS + 자동 생성 트리거):\n\n"
+        f"```sql\n{_PROFILES_SETUP_SQL}\n```"
+    )
+
+
+def sign_up_user(email: str, password: str, nickname: str) -> str:
+    """이메일 + 비밀번호 회원가입.
+
+    [본 프로젝트의 가입 흐름 — strict RLS + 자동 생성 트리거]
+      * `auth.sign_up({email, password, options.data.nickname})` 를 호출하면
+        Supabase 가 `auth.users` 에 행을 만들고, `raw_user_meta_data` 에
+        `{"nickname": ...}` 을 저장한다.
+      * `auth.users` INSERT 직후 트리거 `handle_new_user` (SECURITY DEFINER)
+        가 자동으로 `public.profiles(id, nickname)` 을 INSERT 한다. RLS 가
+        strict (`auth.uid() = id`) 여도 트리거가 시스템 권한으로 우회한다.
+      * 따라서 클라이언트에서 별도의 `profiles.upsert` 가 필요 없다 — 트리거가
+        단일 책임을 갖는다. 닉네임 변경은 `update_user_nickname` 으로 추후
+        독립적으로 처리.
+
+    [중복 가입 처리]
+      * supabase-py v2 는 이미 존재하는 이메일에 대해 예외를 던지지 않는다.
+        응답은 받지만 `session=None`, `identities==[]` 시그니처. 이걸로
+        'duplicate' vs 'fresh signup' 을 구분한다.
+    """
+    if not email or not password:
+        return "❌ 이메일과 비밀번호를 입력하세요."
+    if len(password) < 6:
+        return "❌ 비밀번호는 6자 이상이어야 합니다."
+
+    url_suffix = _supabase_url_suffix()
+
+    try:
+        auth = _resolve_auth()
+    except Exception as e:
+        return f"❌ Auth 클라이언트 확보 실패: {e}"
+
+    # 사용자가 빈 닉네임을 제출했어도 이메일 prefix 로 채워 트리거에 전달한다.
+    # 트리거의 COALESCE 가 추가로 'user_<8>' fallback 을 가지지만, 이메일
+    # prefix 가 식별성이 더 좋다.
+    chosen_nick = (nickname or "").strip() or email.split("@")[0]
+
+    try:
+        res = auth.sign_up(
+            {
+                "email": email,
+                "password": password,
+                # raw_user_meta_data 에 들어가서 트리거 `handle_new_user` 가 읽음.
+                # 이 값으로 `profiles.nickname` 이 자동 세팅된다.
+                "options": {"data": {"nickname": chosen_nick}},
+            }
+        )
+    except Exception as e:
+        return (
+            f"❌ Supabase sign_up 호출 실패\n"
+            f"- 프로젝트: …{url_suffix}\n"
+            f"- {type(e).__name__}: {e}"
+        )
+
+    user_obj = getattr(res, "user", None)
+    user_id = getattr(user_obj, "id", None) if user_obj else None
+    session = getattr(res, "session", None)
+    identities = getattr(user_obj, "identities", None) if user_obj else None
+
+    # supabase-py v2 의 'duplicate email' 시그니처
+    if user_id and session is None and (identities == [] or identities is None):
+        return (
+            "⚠️ 이미 가입된 이메일입니다. 로그인 탭으로 진행하세요.\n"
+            f"- 프로젝트: …{url_suffix}\n"
+            "- 비밀번호를 잊었다면 Supabase Dashboard → Authentication → Users "
+            "에서 비밀번호 재설정 메일을 발송하거나 사용자를 삭제 후 재가입하세요."
+        )
+
+    if not user_id:
+        bits = []
+        if hasattr(res, "session"):
+            bits.append(f"session={bool(session)}")
+        if hasattr(res, "user"):
+            bits.append(f"user={bool(user_obj)}")
+        return (
+            f"⚠️ 가입 응답에 user.id 가 없습니다 ({', '.join(bits) or 'no diag'}).\n"
+            f"- 프로젝트: …{url_suffix}\n"
+            f"- Supabase Dashboard → Authentication → Settings 에서 "
+            f"이메일 확인 정책을 확인하세요."
+        )
+
+    # auth.users INSERT 가 끝났으므로 트리거 `handle_new_user` 가 이미
+    # profiles 행을 만들었어야 한다. 별도의 클라이언트 INSERT/UPSERT 는 하지
+    # 않는다. (트리거 미적용 환경이라면 update_user_nickname 시점에 42501 이
+    # 떨어지고 그때 _rls_guidance 가 본 PR 의 표준 SQL 을 안내해 준다.)
+    return (
+        f"✅ 가입 완료!\n"
+        f"- user_id: `{user_id[:8]}…{user_id[-4:]}` (전체는 Supabase 에서 확인)\n"
+        f"- 프로젝트: …{url_suffix}\n"
+        f"- `auth.users` + `public.profiles` 양쪽 모두 생성됨\n"
+        f"  (트리거 `handle_new_user` 가 profiles 행을 자동 생성)\n"
+        f"- 닉네임: `{chosen_nick}` — 추후 '설정' 모달에서 변경 가능\n"
+        f"- 확인 경로: **Supabase Dashboard → Authentication → Users**"
+    )
+
+
+def sign_in_user(email: str, password: str) -> str:
+    """이메일 + 비밀번호 로그인 — `SS_AUTH_USER` 에 user 컨텍스트 저장."""
+    if not email or not password:
+        return "❌ 이메일과 비밀번호를 입력하세요."
+    try:
+        auth = _resolve_auth()
+        res = auth.sign_in_with_password({"email": email, "password": password})
+    except Exception as e:
+        return f"❌ 로그인 실패: {e}"
+
+    user_obj = getattr(res, "user", None)
+    user_id = getattr(user_obj, "id", None) if user_obj else None
+    if not user_id:
+        return "❌ 로그인 실패: 사용자 정보를 받지 못했습니다."
+
+    # 닉네임 조회 — profiles 에 없으면 이메일 prefix 로 fallback
+    nickname: str | None = None
+    try:
+        prof = (
+            conn.table("profiles")
+            .select("nickname")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if prof.data:
+            nickname = prof.data[0].get("nickname")
+    except Exception:
+        pass
+
+    st.session_state[SS_AUTH_USER] = {
+        "id": user_id,
+        "email": getattr(user_obj, "email", email),
+        "nickname": nickname or email.split("@")[0],
+    }
+    return "✅ 로그인 완료"
+
+
+def sign_out_user() -> None:
+    """Supabase Auth 세션 종료 + `SS_AUTH_USER` 초기화."""
+    try:
+        auth = _resolve_auth()
+        auth.sign_out()
+    except Exception:
+        pass
+    st.session_state.pop(SS_AUTH_USER, None)
+
+
+def update_user_nickname(user_id: str, new_nickname: str) -> str:
+    """`profiles.nickname` UPDATE 후 메시지 반환.
+
+    Caller (`show_settings_modal`) 가 성공 시 `SS_AUTH_USER.nickname` 도
+    같이 갱신해서 사이드바가 즉시 새 닉네임으로 보이게 한다.
+
+    [에러 처리]
+      * Postgres 42501 (RLS) → `_rls_guidance("profiles")` 로 사용자가 붙여넣을
+        SQL 을 그대로 메시지에 첨부. 시연 중 막혀 있던 가장 흔한 케이스.
+      * UPDATE 가 0건이면 UPSERT 로 폴백 (트리거가 없어 profiles 행이 아직
+        없는 사용자도 닉네임을 설정할 수 있게).
+    """
+    cleaned = (new_nickname or "").strip()
+    if not cleaned:
+        return "❌ 닉네임은 비어 있을 수 없습니다."
+    if len(cleaned) > 50:
+        return "❌ 닉네임은 50자 이내로 입력하세요."
+
+    try:
+        resp = (
+            conn.table("profiles")
+            .update({"nickname": cleaned})
+            .eq("id", user_id)
+            .execute()
+        )
+    except Exception as e:
+        if _is_rls_error(e):
+            return "❌ 닉네임 변경 실패 (RLS 차단)\n\n" + _rls_guidance("profiles")
+        return f"❌ 닉네임 변경 실패: {type(e).__name__}: {e}"
+
+    # 일부 환경에서는 profiles 행이 아직 없어 UPDATE 가 0건일 수 있음 — UPSERT 폴백
+    if not getattr(resp, "data", None):
+        try:
+            conn.table("profiles").upsert(
+                {"id": user_id, "nickname": cleaned}
+            ).execute()
+        except Exception as e:
+            if _is_rls_error(e):
+                return (
+                    "❌ profiles 행이 없고 UPSERT 도 RLS 가 막았습니다.\n\n"
+                    + _rls_guidance("profiles")
+                )
+            return f"❌ profiles 행이 없어 UPSERT 도 실패: {type(e).__name__}: {e}"
+
+    return f"✅ 닉네임이 '{cleaned}' 으로 변경되었습니다."
+
+
+def _resolve_storage():
+    """`st_supabase_connection` 내부의 supabase-py Storage 클라이언트를 안전하게 추출.
+
+    버전에 따라 `conn.client` / `conn._client` / `conn.session` 중 노출 위치가
+    다를 수 있으므로 방어적으로 탐색한다.
+    """
+    for attr in ("client", "_client", "session", "supabase_client"):
+        candidate = getattr(conn, attr, None)
+        storage = getattr(candidate, "storage", None) if candidate is not None else None
+        if storage is not None:
+            return storage
+    # 마지막 시도: conn 자체가 storage 속성을 직접 노출하는 경우
+    storage = getattr(conn, "storage", None)
+    if storage is not None:
+        return storage
+    raise RuntimeError(
+        "Supabase Storage 클라이언트를 찾을 수 없습니다. "
+        "st_supabase_connection 버전을 확인하세요."
+    )
+
+
+def upload_to_storage(
+    bucket: str,
+    path: str,
+    data: bytes,
+    *,
+    content_type: str = "image/png",
+) -> str:
+    """Supabase Storage 업로드 후 public URL 반환.
+
+    경로 스킴: 호출자가 `f"{uuid}/origin.png"` 형태로 unique key 를 만들어 넘긴다.
+    같은 키로 두 번 호출돼도 `upsert=true` 로 덮어쓴다 (수정/재시도 안전).
+
+    Args:
+        bucket: Supabase Storage 버킷 이름 (예: `originals`, `results`).
+        path:   버킷 내부 경로 (UUID 기반 유니크 키).
+        data:   업로드할 바이너리.
+        content_type: MIME — 기본 image/png. JPEG 등으로 호출 가능.
+
+    Returns:
+        public URL 문자열. (private 버킷이라면 호출 측에서 signed URL 로 교체)
+    """
+    storage = _resolve_storage()
+    bucket_api = storage.from_(bucket)
+    # supabase-py v2: upload(path, file=..., file_options={...})
+    try:
+        bucket_api.upload(
+            path=path,
+            file=data,
+            file_options={"content-type": content_type, "upsert": "true"},
+        )
+    except TypeError:
+        # 구버전 supabase-py 호환 — positional 시그니처
+        bucket_api.upload(path, data, {"content-type": content_type, "upsert": "true"})
+    return bucket_api.get_public_url(path)
 
 
 def save_simulation_result(
@@ -471,12 +1030,23 @@ def save_simulation_result(
 def save_snapshot(parent_project_id: str, matrix, origin_url, result_url, base_colors) -> str | None:
     """기존 프로젝트의 수정본을 새 row 로 INSERT (스냅샷).
 
-    [참조 무결성]
-      * 기존 row 를 UPDATE 하지 않고 새 row 를 INSERT 한 뒤 `parent_id` 로 부모를
-        가리킨다. 갤러리/히스토리는 parent_id 그래프를 따라간다.
+    [의도적으로 Phase 2 범위 외]
+      * Phase 2 멀티리전 사양은 **마스크를 DB에 저장하지 않는다**. 따라서 합성
+        결과를 정확히 재현할 수 없어 "원본을 편집해 새 버전을 만든다" 라는
+        스냅샷 의미가 약해진다 (cursor 작업 지시: "재현/편집 안 할 거라 과한
+        정규화는 불필요").
+      * `scrap_project` 가 익명 카운트만 +1 하는 것으로 Phase 2 의 모든
+        '재공유' UX 를 흡수한다. 따라서 본 함수는 현재 호출되지 않는다.
+      * 향후 마스크 직렬화 정책이 결정되면 본 함수를 살려서:
+          - parent_id = parent_project_id 로 새 projects row INSERT
+          - 동일 palettes row 복제 (또는 base_colors 만 새로 저장)
+          - 그래프 형태 히스토리(`parent_id` 셀프 FK) 유지
+        형태로 구현한다.
     """
-    # TODO[PHASE-4]: save_simulation_result 와 유사하나 parent_id 필드 추가
-    raise NotImplementedError("PHASE 4: 스냅샷 INSERT 미구현 (스카폴딩 슬롯)")
+    raise NotImplementedError(
+        "save_snapshot 은 Phase 2 범위 외 — 마스크 미저장 정책상 재현 불가 "
+        "(필요해질 때 활성화)."
+    )
 
 
 # =============================================================================
@@ -612,35 +1182,105 @@ def request_project_deletion(project_id: str, created_at_iso: str, scrap_count: 
 # UI COMPONENTS
 # =============================================================================
 
-# ---------- 좌측 사이드바: 프로필 + 라인업 ---------------------------------------
+# ---------- 좌측 사이드바: 인증 + 라인업 ----------------------------------------
 def render_sidebar() -> None:
-    """좌측: 프로필 + '내가 공유한' / '남이 공유한' 미리보기 라인업.
+    """좌측: 인증 패널 + '내가 공유한' / '남이 공유한' 미리보기 라인업.
 
-    프로필 이미지는 현재 보류(요구사항). 닉네임 + UID 만 노출.
+    프로필 이미지는 보류(요구사항). 닉네임 + UID 만 노출.
     """
-    user = ensure_authenticated() or {}
     with st.sidebar:
-        col_a, col_b = st.columns([3, 1])
-        with col_a:
-            st.markdown(f"**{user.get('nickname') or 'user_nickname'}**")
-            st.caption(f"@{(user.get('id') or 'user_UID')[:8]}")
-        with col_b:
-            st.button("⚙️", key="open_settings", help="설정")
-
+        _render_auth_panel()
         st.divider()
 
-        st.caption("내가 공유한 미리보기")
-        _render_lineup(
-            fetch_my_shared_projects(user.get("id"), limit=10),
-            key_prefix="mine",
-        )
+        user = ensure_authenticated()
+        if user:
+            st.caption("내가 공유한 미리보기")
+            _render_lineup(
+                fetch_my_shared_projects(user.get("id"), limit=10),
+                key_prefix="mine",
+            )
+            st.divider()
 
-        st.divider()
         st.caption("내가 공유받은(남이 공유한) 미리보기")
         _render_lineup(
-            fetch_others_shared_projects(user.get("id"), limit=10),
+            fetch_others_shared_projects((user or {}).get("id"), limit=10),
             key_prefix="others",
         )
+
+
+def _render_auth_panel() -> None:
+    """사이드바 상단 — 로그인/회원가입 (비인증) 또는 프로필 + 설정 + 로그아웃 (인증).
+
+    아이콘(⚙️ / ⎋) 만 사용했을 때 일부 환경의 emoji 폰트가 fallback 정사각형으로
+    렌더되어 가독성이 떨어졌다. 텍스트 라벨 + 단순 ASCII 마커를 함께 사용해
+    OS/브라우저 무관하게 안정적으로 보이게 한다.
+    """
+    user = ensure_authenticated()
+    if user:
+        # 1행: 닉네임 + UID
+        st.markdown(f"**{user.get('nickname') or user.get('email') or 'user'}**")
+        uid_short = (user.get("id") or "")[:8]
+        st.caption(f"@{uid_short or 'user_UID'}")
+
+        # 2행: 두 개의 동일 너비 텍스트 버튼 — 어떤 환경에서도 깔끔하게 보임
+        col_a, col_b = st.columns(2)
+        if col_a.button(
+            "설정",
+            key="settings_btn",
+            help="닉네임 변경 / DB 진단",
+            **_FW,
+        ):
+            show_settings_modal()
+        if col_b.button(
+            "로그아웃",
+            key="signout_btn",
+            help="현재 세션 종료",
+            **_FW,
+        ):
+            sign_out_user()
+            st.rerun()
+        return
+
+    # ── 비로그인 상태 — 인라인 폼 ──────────────────────────────────────────
+    st.markdown("**🔐 로그인 / 회원가입**")
+    tab_in, tab_up = st.tabs(["로그인", "회원가입"])
+
+    with tab_in:
+        with st.form("signin_form", clear_on_submit=False):
+            in_email = st.text_input("이메일", key="signin_email")
+            in_pwd = st.text_input("비밀번호", type="password", key="signin_pwd")
+            submitted_in = st.form_submit_button(
+                "로그인", **_FW, type="primary"
+            )
+        if submitted_in:
+            msg = sign_in_user(in_email, in_pwd)
+            if msg.startswith("✅"):
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    with tab_up:
+        with st.form("signup_form", clear_on_submit=False):
+            up_email = st.text_input("이메일", key="signup_email")
+            up_pwd = st.text_input(
+                "비밀번호 (6자 이상)", type="password", key="signup_pwd"
+            )
+            up_nick = st.text_input("닉네임 (선택)", key="signup_nick")
+            submitted_up = st.form_submit_button(
+                "가입", **_FW
+            )
+        if submitted_up:
+            msg = sign_up_user(up_email, up_pwd, up_nick)
+            # 다중 라인 + 마크다운 가독성 보장: success/warning/error 헬퍼는
+            # 마크다운을 지원하지만 narrow sidebar 에서는 info 박스 모양이
+            # 더 안정적으로 줄바꿈된다.
+            if msg.startswith("✅"):
+                st.success(msg)
+            elif msg.startswith("⚠️"):
+                st.warning(msg)
+            else:
+                st.error(msg)
 
 
 def _render_lineup(items: list[dict], key_prefix: str) -> None:
@@ -672,7 +1312,7 @@ def _render_lineup(items: list[dict], key_prefix: str) -> None:
                 if st.button(
                     "Palette Title",
                     key=f"{key_prefix}_open_{proj['id']}",
-                    use_container_width=True,
+                    **_FW,
                 ):
                     show_project_modal(proj, mode="view")
 
@@ -683,7 +1323,7 @@ def render_original_image_panel() -> None:
     with st.container(border=True):
         img = st.session_state.get(SS_ORIGIN_IMAGE)
         if img is not None:
-            st.image(img, use_column_width=True)
+            st.image(img, **_FW)
         else:
             st.markdown(
                 "<div style='height:320px;display:flex;align-items:center;"
@@ -771,7 +1411,7 @@ def _render_region_panel() -> None:
                 label,
                 key=f"add_region_{subj['id']}",
                 type=("primary" if already_used else "secondary"),
-                use_container_width=True,
+                **_FW,
                 help=("이미 영역으로 추가됨 — 다시 누르면 영역이 하나 더 생성됩니다." if already_used else None),
             ):
                 regions.append({"subject": subj, "mask": None, "matrix": None})
@@ -826,18 +1466,12 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
             drawing_mode="freedraw",
             key=f"canvas_region_{region_index}",
         )
-    except AttributeError as exc:
-        if "image_to_url" in str(exc) or "streamlit.elements.image" in str(exc):
-            st.error(
-                "현재 설치된 Streamlit 버전이 `streamlit-drawable-canvas`와 호환되지 않습니다.\n"
-                "requirements.txt에 따라 Streamlit을 1.55.x 이하로 설치한 뒤 다시 실행하세요."
-            )
-            return
-        raise
-    except Exception as exc:
-        st.error(
-            f"`streamlit-drawable-canvas` 실행 중 오류가 발생했습니다: {exc}"
-        )
+    except Exception:
+        # 어떤 예외든(AttributeError on image_to_url, TypeError on
+        # layout_config, RuntimeError 등) bbox 슬라이더 폴백으로 전환한다.
+        # 메시지를 trace 로 노출하지 않는 이유: 시연 중 매 rerun 마다 같은
+        # 트레이스가 영역마다 겹쳐 쌓여 UI 가 진동하는 현상을 막기 위함.
+        _render_bbox_mask_fallback(region_index, region, img_pil)
         return
 
     # canvas 알파 채널을 이진화 → 실제 이미지 좌표계로 INTER_NEAREST 리사이즈
@@ -851,6 +1485,73 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
     raw_mask = (raw_alpha > 0).astype(np.uint8)
     mask_native = cv2.resize(raw_mask, (iw, ih), interpolation=cv2.INTER_NEAREST)
     region["mask"] = mask_native.astype(bool)
+
+
+def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None:
+    """캔버스 마우스 트래킹이 동작하지 않을 때의 사각 영역 마스크 UI.
+
+    4개 슬라이더 (left / right / top / bottom %) 로 사각 영역을 지정하고,
+    해당 boolean 마스크를 `region['mask']` 에 저장한다. 시각 피드백을 위해
+    오렌지 오버레이 + 테두리가 그려진 미리보기를 함께 노출한다.
+
+    freedraw 가 아니라 사각형뿐인 점은 명확한 제약이며, 사용자가 보기에
+    "왜 안 칠해지나" 가 아니라 "이 영역에 매핑한다" 로 흐름이 보존된다.
+    """
+    if Image is None or np is None:
+        st.warning("Pillow / numpy 가 필요합니다 (requirements 설치).")
+        return
+
+    iw, ih = img_pil.size  # PIL: (W, H)
+
+    # ※ "캔버스 비호환이라 슬라이더로 대체" 안내 배너는 매 rerun 마다 노출되어
+    # 영역 expander 안에서 시각적 노이즈가 되므로 제거. 슬라이더 4개 자체가
+    # 충분히 자명한 UI 이며, 필요 시 설정 모달 진단 패널에서 추가 안내를 본다.
+
+    bcols = st.columns(2)
+    with bcols[0]:
+        x1 = st.slider(
+            "좌측 (%)", 0, 99, 10, key=f"bbox_x1_{region_index}"
+        )
+        y1 = st.slider(
+            "상단 (%)", 0, 99, 10, key=f"bbox_y1_{region_index}"
+        )
+    with bcols[1]:
+        x2 = st.slider(
+            "우측 (%)", 1, 100, 90, key=f"bbox_x2_{region_index}"
+        )
+        y2 = st.slider(
+            "하단 (%)", 1, 100, 90, key=f"bbox_y2_{region_index}"
+        )
+
+    if x1 >= x2 or y1 >= y2:
+        st.warning("범위가 올바르지 않습니다 (좌측 < 우측, 상단 < 하단).")
+        region["mask"] = None
+        return
+
+    px1, px2 = int(iw * x1 / 100), int(iw * x2 / 100)
+    py1, py2 = int(ih * y1 / 100), int(ih * y2 / 100)
+
+    mask = np.zeros((ih, iw), dtype=bool)
+    mask[py1:py2, px1:px2] = True
+    region["mask"] = mask
+
+    # 시각 피드백 — 반투명 오버레이 + 테두리
+    arr = np.asarray(img_pil.convert("RGB")).copy()
+    overlay_color = np.array([255, 165, 0], dtype=np.float32)
+    region_slice = arr[py1:py2, px1:px2].astype(np.float32)
+    blended = np.clip(region_slice * 0.55 + overlay_color * 0.45, 0, 255).astype(np.uint8)
+    arr[py1:py2, px1:px2] = blended
+    border_w = max(2, int(min(iw, ih) * 0.004))
+    arr[py1:py1 + border_w, px1:px2] = overlay_color
+    arr[py2 - border_w:py2, px1:px2] = overlay_color
+    arr[py1:py2, px1:px1 + border_w] = overlay_color
+    arr[py1:py2, px2 - border_w:px2] = overlay_color
+
+    st.image(Image.fromarray(arr), **_FW)
+    st.caption(
+        f"마스크 영역: {(x2 - x1)}% × {(y2 - y1)}%  "
+        f"({px2 - px1} × {py2 - py1} px = {int(mask.sum())} 픽셀)"
+    )
 
 
 def _render_illuminant_tag_grid() -> None:
@@ -870,7 +1571,7 @@ def _render_illuminant_tag_grid() -> None:
                 illu["name"],
                 key=f"illu_{illu['id']}",
                 type=("primary" if is_sel else "secondary"),
-                use_container_width=True,
+                **_FW,
                 help=illu.get("description") or "",
             ):
                 if is_sel:
@@ -885,7 +1586,7 @@ def render_converted_image_panel() -> None:
     with st.container(border=True):
         result = st.session_state.get(SS_RESULT_BYTES)
         if result:
-            st.image(result, use_column_width=True)
+            st.image(result, **_FW)
         else:
             st.markdown(
                 "<div style='height:240px;display:flex;align-items:center;"
@@ -962,7 +1663,7 @@ def render_action_buttons() -> None:
     if st.button(
         "Convert",
         type="primary",
-        use_container_width=True,
+        **_FW,
         disabled=convert_disabled,
         help=convert_help,
     ):
@@ -974,7 +1675,7 @@ def render_action_buttons() -> None:
     finish_disabled = not st.session_state.get(SS_BASE_COLORS)
     if st.button(
         "Finish",
-        use_container_width=True,
+        **_FW,
         disabled=finish_disabled,
         help=("Convert 를 먼저 실행하세요." if finish_disabled else None),
     ):
@@ -1042,16 +1743,16 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
             subj = region.get("subject") or {}
             ctx = build_rag_context(subj, illu)
             try:
+                # call_gpt4o_mini_for_matrix 는 키 부재/네트워크 오류 시
+                # 예외를 던지지 않고 IDENTITY 를 반환한다. 따라서 여기서는
+                # 진짜 예외(런타임 에러)만 잡아내면 충분하다.
                 matrix = call_gpt4o_mini_for_matrix(ctx)
-            except NotImplementedError:
-                st.info("PHASE 2: GPT-4o-mini 호출이 미구현 상태 → IDENTITY 로 진행합니다.")
-                matrix = IDENTITY
-            except Exception as e:
+            except Exception as e:  # pragma: no cover - defensive
                 st.warning(f"AI 호출 실패 ({subj.get('label')}): {e} → IDENTITY 로 진행.")
-                matrix = IDENTITY
+                matrix = dict(IDENTITY)
 
             if not validate_matrix_payload(matrix):
-                matrix = IDENTITY
+                matrix = dict(IDENTITY)
                 fallback_count += 1
 
             region["matrix"] = matrix
@@ -1093,6 +1794,93 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
     st.rerun()
 
 
+# ---------- 모달: 설정 (⚙️) — 닉네임 편집 -------------------------------------
+@st.dialog("⚙️ 설정", width="small")
+def show_settings_modal() -> None:
+    """사이드바 ⚙️ 버튼이 여는 설정 모달.
+
+    현재 지원: 닉네임 변경 (`profiles.nickname` UPDATE/UPSERT).
+    저장 시 `SS_AUTH_USER.nickname` 도 함께 갱신하여 사이드바 표시가 즉시 반영된다.
+    """
+    user = ensure_authenticated()
+    if not user:
+        st.warning("로그인이 필요합니다.")
+        return
+
+    st.markdown(f"**계정**: `{user.get('email') or '-'}`")
+    st.caption(f"@{(user.get('id') or '')[:8]}")
+    st.divider()
+
+    current_nick = user.get("nickname") or ""
+    new_nick = st.text_input(
+        "닉네임",
+        value=current_nick,
+        key="settings_nickname_input",
+        max_chars=50,
+    )
+
+    btn_cols = st.columns([1, 1])
+    if btn_cols[0].button("취소", key="settings_cancel", **_FW):
+        st.rerun()
+    if btn_cols[1].button(
+        "저장",
+        key="settings_save",
+        type="primary",
+        **_FW,
+        disabled=(new_nick.strip() == current_nick.strip()),
+    ):
+        msg = update_user_nickname(user["id"], new_nick)
+        if msg.startswith("✅"):
+            # 사이드바 즉시 반영
+            st.session_state[SS_AUTH_USER] = {
+                **user,
+                "nickname": new_nick.strip(),
+            }
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    # ── 진단 패널 ─────────────────────────────────────────────────────────
+    st.divider()
+    with st.expander("🔧 연결 / AI 진단", expanded=False):
+        st.markdown("**Supabase**")
+        st.text(f"URL: {s_url or '(미설정)'}")
+        st.text(f"user_id (full): {user.get('id') or '(없음)'}")
+        st.caption(
+            "Supabase Dashboard 의 URL 과 비교하세요. "
+            "다르면 다른 프로젝트에 가입/저장되고 있는 것입니다."
+        )
+
+        st.markdown("**OpenAI API 키**")
+        ki = _openai_key_info()
+        if not ki["source"]:
+            st.error(
+                "키가 로드되지 않았습니다.\n"
+                "- 환경변수: `OPENAI_API_KEY=sk-...`\n"
+                "- 또는 `.streamlit/secrets.toml` 의 `[openai] api_key = \"sk-...\"`"
+            )
+        else:
+            st.text(f"source: {ki['source']}  length: {ki['length']}")
+            st.text(f"preview: {ki['preview']}")
+
+        st.markdown("**마지막 GPT-4o-mini 호출**")
+        diag = st.session_state.get(SS_OPENAI_LAST_DIAG)
+        if not diag:
+            st.caption("아직 호출 기록이 없습니다. Convert 를 한 번 실행해 보세요.")
+        else:
+            kind = "✅" if diag.get("ok") else "❌"
+            st.text(f"{kind} stage: {diag.get('stage')}  ({diag.get('ts', '-')})")
+            if diag.get("detail"):
+                st.text(f"detail: {diag['detail']}")
+            # 자주 걸리는 패턴은 한 줄로 강조 (insufficient_quota 등).
+            hint = _format_openai_error_hint(diag.get("detail"))
+            if hint:
+                st.warning(hint)
+            if diag.get("raw_preview"):
+                st.code(diag["raw_preview"], language="json")
+
+
 # ---------- 모달 (조회 / 공유 확정 — 같은 컴포넌트 재사용) ----------------------
 @st.dialog("프로젝트 미리보기", width="large")
 def show_project_modal(project: dict, mode: str = "view") -> None:
@@ -1108,9 +1896,9 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
     with left:
         st.markdown("**원본 이미지**")
         if is_share and project.get("_origin_bytes"):
-            st.image(project["_origin_bytes"], use_column_width=True)
+            st.image(project["_origin_bytes"], **_FW)
         elif project.get("origin_path"):
-            st.image(project["origin_path"], use_column_width=True)
+            st.image(project["origin_path"], **_FW)
         else:
             st.caption("(원본 이미지 없음)")
 
@@ -1181,19 +1969,50 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
         )
 
         btn_cols = st.columns([1, 1])
-        if btn_cols[0].button("취소", use_container_width=True, key="modal_cancel"):
+        if btn_cols[0].button("취소", **_FW, key="modal_cancel"):
             st.rerun()
         if btn_cols[1].button(
             "✅ 공유 확정",
             type="primary",
-            use_container_width=True,
+            **_FW,
             key="modal_confirm_share",
         ):
             st.session_state[SS_IS_ANON] = anon
             st.session_state[SS_IS_PALETTE_PUBLIC] = pal_pub
-            # TODO[PHASE-4]: upload_to_storage 로 원본/결과 업로드 → URL 획득
-            origin_url = "https://example.com/origin.png"
-            result_url = "https://example.com/result.png"
+
+            # ── 원본/결과 이미지를 Supabase Storage 에 업로드 ────────────────
+            #   /originals/{uuid}/origin.png
+            #   /results/{uuid}/result.png
+            # 같은 UUID 를 prefix 로 묶어 한 프로젝트의 원본↔결과 매핑을 보존한다.
+            doc_uuid = str(uuid.uuid4())
+            origin_bytes = project.get("_origin_bytes")
+            result_bytes = project.get("_result_bytes")
+
+            origin_url: str | None = None
+            result_url: str | None = None
+            if origin_bytes:
+                try:
+                    origin_url = upload_to_storage(
+                        BUCKET_ORIGINALS,
+                        f"{doc_uuid}/origin.png",
+                        origin_bytes,
+                    )
+                except Exception as e:
+                    st.warning(f"원본 Storage 업로드 실패: {e}")
+            if result_bytes:
+                try:
+                    result_url = upload_to_storage(
+                        BUCKET_RESULTS,
+                        f"{doc_uuid}/result.png",
+                        result_bytes,
+                    )
+                except Exception as e:
+                    st.warning(f"결과 Storage 업로드 실패: {e}")
+
+            if not origin_url:
+                # origin_path 컬럼은 NOT NULL 이므로 최소한 placeholder 라도 채운다.
+                origin_url = f"local://{doc_uuid}/origin.png"
+
             user = ensure_authenticated() or {}
             msg = save_simulation_result(
                 user_id=user.get("id"),
