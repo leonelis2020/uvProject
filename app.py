@@ -1478,12 +1478,13 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
             drawing_mode="freedraw",
             key=f"canvas_region_{region_index}",
         )
-    except Exception:
-        # 어떤 예외든(AttributeError on image_to_url, TypeError on
-        # layout_config, RuntimeError 등) bbox 슬라이더 폴백으로 전환한다.
-        # 메시지를 trace 로 노출하지 않는 이유: 시연 중 매 rerun 마다 같은
-        # 트레이스가 영역마다 겹쳐 쌓여 UI 가 진동하는 현상을 막기 위함.
-        _render_bbox_mask_fallback(region_index, region, img_pil)
+    except Exception as exc:
+        # 어떤 예외든 bbox 슬라이더 폴백으로 전환한다. 이전엔 예외를 완전히
+        # 숨겼는데, 그 결과 사용자가 "왜 캔버스가 안 보이지?" 를 진단할 방법이
+        # 없었다. 폴백 안에 접힌 진단 expander 로 streamlit / canvas 버전과
+        # 실제 예외를 노출한다 (rerun 누적 노이즈는 expander 가 접혀 있어
+        # 발생하지 않음).
+        _render_bbox_mask_fallback(region_index, region, img_pil, canvas_error=exc)
         return
 
     # canvas 알파 채널을 이진화 → 실제 이미지 좌표계로 INTER_NEAREST 리사이즈
@@ -1499,7 +1500,13 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
     region["mask"] = mask_native.astype(bool)
 
 
-def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None:
+def _render_bbox_mask_fallback(
+    region_index: int,
+    region: dict,
+    img_pil,
+    *,
+    canvas_error: Exception | None = None,
+) -> None:
     """캔버스 마우스 트래킹이 동작하지 않을 때의 사각 영역 마스크 UI.
 
     4개 슬라이더 (left / right / top / bottom %) 로 사각 영역을 지정하고,
@@ -1564,6 +1571,31 @@ def _render_bbox_mask_fallback(region_index: int, region: dict, img_pil) -> None
         f"마스크 영역: {(x2 - x1)}% × {(y2 - y1)}%  "
         f"({px2 - px1} × {py2 - py1} px = {int(mask.sum())} 픽셀)"
     )
+
+    # ── 캔버스가 왜 폴백됐는지 진단 (접힌 채로 — 노이즈 X, 필요 시 펼침) ──
+    with st.expander("🔧 캔버스 진단 (왜 슬라이더로 폴백?)", expanded=False):
+        st.code(f"streamlit:                 {st.__version__}", language="text")
+        try:
+            import streamlit_drawable_canvas as _sdc  # type: ignore
+            sdc_ver = getattr(_sdc, "__version__", "(unknown)")
+            st.code(f"streamlit-drawable-canvas: {sdc_ver}", language="text")
+        except Exception as e:
+            st.code(
+                f"streamlit-drawable-canvas: import 실패 — "
+                f"{type(e).__name__}: {e}",
+                language="text",
+            )
+        if canvas_error is not None:
+            st.code(
+                f"canvas 호출 예외:           "
+                f"{type(canvas_error).__name__}: {canvas_error}",
+                language="text",
+            )
+        st.caption(
+            "freedraw 가 되려면 `streamlit==1.41.1` 이 설치돼 있어야 합니다. "
+            "위 버전이 1.41.x 가 아니면 `pip install --upgrade --force-reinstall "
+            "-r requirements.txt` 를 실행하세요."
+        )
 
 
 def _render_illuminant_tag_grid() -> None:
