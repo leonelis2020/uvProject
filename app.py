@@ -461,13 +461,16 @@ def apply_false_color_array(
         # 3) false-color 축으로 채널 시프트 (UV쪽 = 파랑/보라/청록 계열로)
         #    원래 G편차→R, B편차→G, R편차→B  (가시 구조색을 UV 무지개로 회전)
         irid = np.stack([amp[..., 1], amp[..., 2], amp[..., 0]], axis=-1)
-        # 4) 까마귀 짤처럼 '어두운 베이스 + 은은한 광택':
-        #    - 베이스를 어둡게 깔고(구조색 깃털은 기본이 어둡다)
-        #    - 광택은 밝은 부위(luma 큰 곳)에서만 강하게 드러나도록 luma 로 게이팅
+        # 4) '베이스 + 광택':
+        #    - 베이스: 원본 밝기에 target 색조를 입히되 너무 어두워지지 않게.
+        #      target 색조(파랑)만 곱하면 칙칙해지므로 약간의 중성 밝기를 섞는다.
+        #    - 광택: 밝은 부위(luma 큰 곳)에서만 강하게 드러나도록 luma 로 게이팅
         #      → 어두운 그림자엔 광택이 안 끼고, 빛 받는 면에서만 무지개가 번쩍.
-        base = luma * target * 0.55          # 어두운 바탕 (네온 떡칠 방지)
-        gate = np.clip(luma * 1.3, 0.0, 1.0)  # 밝을수록 광택 강하게
-        recolored = np.clip(base + irid * gate * 0.45, 0.0, 1.0)
+        tinted = luma * target              # 색조 입힌 밝기
+        neutral = luma * 0.5               # 중성 밝기 (칙칙함 방지)
+        base = (tinted * 0.7 + neutral * 0.3) * 1.25
+        gate = np.clip(luma * 1.3, 0.0, 1.0)
+        recolored = np.clip(base + irid * gate * 0.5, 0.0, 1.0)
 
     out = img * (1.0 - strength) + recolored * strength
     return np.clip(out, 0.0, 1.0).astype(np.float32)
