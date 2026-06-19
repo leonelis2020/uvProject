@@ -48,6 +48,18 @@ except Exception:  # pragma: no cover
     cv2 = None  # type: ignore
 
 
+# ── set_page_config 는 모든 Streamlit 명령보다 먼저 실행돼야 한다 ─────────────
+# 아래의 `conn = st.connection(...)` / `st.error(...)` 등 모듈 레벨 Streamlit
+# 호출이 있어서, `main()` 안에 두면 "set_page_config can only be called once
+# per app" 에러가 나거나 새 codespace 에서 앱이 안 열리는 일이 있다 (사용자
+# 보고). 모듈 최상단으로 끌어올린다.
+st.set_page_config(
+    page_title="UV 모사 팔레트 연구실",
+    page_icon="🎨",
+    layout="wide",
+)
+
+
 # ── Streamlit 버전 호환 헬퍼 ──────────────────────────────────────────────────
 # Streamlit 의 width 관련 API 가 두 번 deprecate 됐다:
 #   * `use_column_width=True`     : ~1.32 이전 표준 → 1.32+ 에서 deprecated
@@ -2062,7 +2074,7 @@ def _lookup_label(table: str, row_id: str | None, name_col: str = "label") -> st
 # =============================================================================
 
 def main() -> None:
-    st.set_page_config(page_title="UV 모사 팔레트 연구실", page_icon="🎨", layout="wide")
+    # NOTE: st.set_page_config() 는 모듈 최상단에서 한 번만 호출 (중복 호출 금지)
     st.title("🎨 UV 모사 팔레트 연구실")
 
     render_sidebar()
