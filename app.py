@@ -427,11 +427,22 @@ def apply_false_color_array(
     img: "np.ndarray",
     target_rgb,
     strength: float = 1.0,
+    mode: str = "iridescent",
+    sat_boost: float = 7.0,
 ) -> "np.ndarray":
-    """H×W×3 [0,1] 원본을 target_rgb 색조로 리컬러. 원본 luma(명암 디테일) 보존.
+    """H×W×3 [0,1] 원본을 false-color 로 변환. 두 가지 모드.
 
-    멀티리전 합성에서 영역마다 target_rgb / strength 를 바꿔 반복 호출한다.
-    `apply_matrix_array` 의 대체 단위 함수 (배열 in/out).
+    mode="flat":
+        원본 luma(밝기) × 단일 target 색. 영역이 한 색으로 균일하게 물든다.
+        (광원 색조를 평평하게 입히고 싶을 때.)
+
+    mode="iridescent" (기본):
+        '무지개 까마귀' 모드. 원본 픽셀의 미세한 색편차(구조색 광택)를 분리·증폭해
+        부위마다 파랑/보라/청록이 다르게 나타나는 영롱한 결과를 만든다. 까마귀처럼
+        검은 깃털의 미묘한 광택이 위치에 따라 다른 색으로 펼쳐진다.
+        sat_boost 가 클수록 무지개가 강해진다.
+
+    멀티리전 합성에서 영역마다 target_rgb / strength / mode 를 바꿔 반복 호출한다.
     """
     if np is None:
         raise NotImplementedError("numpy 미설치")
@@ -439,7 +450,28 @@ def apply_false_color_array(
     luma = (
         0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
     )[..., None]
-    recolored = np.clip(luma * target * 1.6, 0.0, 1.0)  # ×1.6: luma×tint 어두움 보정
+
+    if mode == "flat":
+        recolored = np.clip(luma * target * 1.6, 0.0, 1.0)
+    else:  # iridescent
+        # 1) 무채색(밝기) 제거 → 픽셀별 미세 색편차(구조색)만 남김
+        chroma = img - luma
+        # 2) 색편차 증폭 → 미묘한 광택을 큰 색차로
+        amp = chroma * sat_boost
+        # 3) false-color 축으로 채널 시프트 (UV쪽 = 파랑/보라/청록 계열로)
+        #    원래 G편차→R, B편차→G, R편차→B  (가시 구조색을 UV 무지개로 회전)
+        irid = np.stack([amp[..., 1], amp[..., 2], amp[..., 0]], axis=-1)
+        # 4) '베이스 + 광택':
+        #    - 베이스: 원본 밝기에 target 색조를 입히되 너무 어두워지지 않게.
+        #      target 색조(파랑)만 곱하면 칙칙해지므로 약간의 중성 밝기를 섞는다.
+        #    - 광택: 밝은 부위(luma 큰 곳)에서만 강하게 드러나도록 luma 로 게이팅
+        #      → 어두운 그림자엔 광택이 안 끼고, 빛 받는 면에서만 무지개가 번쩍.
+        tinted = luma * target              # 색조 입힌 밝기
+        neutral = luma * 0.5               # 중성 밝기 (칙칙함 방지)
+        base = (tinted * 0.7 + neutral * 0.3) * 1.25
+        gate = np.clip(luma * 1.3, 0.0, 1.0)
+        recolored = np.clip(base + irid * gate * 0.5, 0.0, 1.0)
+
     out = img * (1.0 - strength) + recolored * strength
     return np.clip(out, 0.0, 1.0).astype(np.float32)
 
@@ -1265,7 +1297,29 @@ def save_simulation_result(
     # None 값은 DB default 로 위임 (NOT NULL 컬럼 보호)
     data_to_insert = {k: v for k, v in data_to_insert.items() if v is not None}
 
-    project_resp = conn.table("projects").insert(data_to_insert).execute()
+    # ── DB 스키마에 일부 컬럼(subject_labels 등)이 없을 수 있다(PGRST204).
+    #    그 경우 누락 컬럼만 빼고 재시도해 '저장 자체가 통째로 실패'하는 것을 막는다.
+    def _insert_with_column_fallback(table_name: str, payload: dict):
+        attempt = dict(payload)
+        for _ in range(len(payload) + 1):
+            try:
+                return conn.table(table_name).insert(attempt).execute()
+            except Exception as e:
+                msg = str(e)
+                # PGRST204: "Could not find the 'X' column" → 그 컬럼 제거 후 재시도
+                if "PGRST204" in msg or "Could not find the" in msg:
+                    import re
+                    m = re.search(r"find the '([^']+)' column", msg)
+                    if m and m.group(1) in attempt:
+                        attempt.pop(m.group(1), None)
+                        continue
+                raise
+        return conn.table(table_name).insert(attempt).execute()
+
+    try:
+        project_resp = _insert_with_column_fallback("projects", data_to_insert)
+    except Exception as e:
+        return f"❌ 저장 실패 (projects INSERT): {type(e).__name__}: {e}"
 
     if project_resp.data:
         try:
@@ -1275,9 +1329,15 @@ def save_simulation_result(
                 else project_resp.data
             )
             p_id = row["id"]
-            conn.table("palettes").insert(
-                {"project_id": p_id, "base_colors": base_colors}
-            ).execute()
+            try:
+                conn.table("palettes").insert(
+                    {"project_id": p_id, "base_colors": base_colors}
+                ).execute()
+            except Exception as e:
+                return (
+                    f"✅ 프로젝트는 저장됨 (ID: {p_id}). "
+                    f"단, 팔레트 저장 실패: {type(e).__name__}"
+                )
             return f"✅ DB 저장 성공! (ID: {p_id})"
         except Exception:
             return "✅ DB 저장은 성공했으나, 화면 표시 중 작은 오류가 발생했습니다. (DB 확인 요망)"
@@ -1342,28 +1402,44 @@ def fetch_my_shared_projects(owner_id: str | None, limit: int = 20) -> list[dict
 
 
 def fetch_others_shared_projects(owner_id: str | None, limit: int = 20) -> list[dict]:
-    """좌측 사이드바 — '남이 공유한' 라인업 (anon_gallery_view 우선, 실패 시 projects fallback)."""
+    """좌측 사이드바 — '남이 공유한' 라인업.
+
+    [버그픽스] 과거엔 is_anonymous=True 인 것만 보여줘서, 닉네임 공개로 공유한
+    프로젝트가 갤러리에 안 떴다("팔레트 공개했는데 안 보임"). 이제 익명 여부와
+    무관하게 '남이 공유한 모든 Active 프로젝트'를 보여준다. (익명 여부는 제작자
+    표시에만 영향.) 닉네임을 함께 가져오기 위해 projects_with_nickname 뷰 우선.
+    """
+    # 1순위: 닉네임 조인 뷰
     try:
-        q = conn.table("anon_gallery_view").select("*").limit(limit)
+        q = (
+            conn.table("projects_with_nickname")
+            .select("*")
+            .eq("status", "Active")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        if owner_id:
+            q = q.neq("owner_id", owner_id)
+        resp = q.execute()
+        if resp.data is not None:
+            return resp.data or []
+    except Exception:
+        pass
+    # 2순위: 뷰 없으면 projects 직접
+    try:
+        q = (
+            conn.table("projects")
+            .select(_PROJECT_SELECT)
+            .eq("status", "Active")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
         if owner_id:
             q = q.neq("owner_id", owner_id)
         resp = q.execute()
         return resp.data or []
     except Exception:
-        try:
-            q = (
-                conn.table("projects")
-                .select(_PROJECT_SELECT)
-                .eq("is_anonymous", True)
-                .order("created_at", desc=True)
-                .limit(limit)
-            )
-            if owner_id:
-                q = q.neq("owner_id", owner_id)
-            resp = q.execute()
-            return resp.data or []
-        except Exception:
-            return []
+        return []
 
 
 def fetch_palette_for_project(project_id: str) -> list[str]:
@@ -1384,20 +1460,73 @@ def fetch_palette_for_project(project_id: str) -> list[str]:
         return []
 
 
-def scrap_project(source_project_id: str, current_scrap_count: int) -> str:
-    """타인의 프로젝트를 스크랩 — 익명 카운트만 +1.
+def scrap_project(source_project_id: str, current_scrap_count: int = 0) -> str:
+    """타인의 프로젝트를 스크랩 — scraps 테이블 직접 INSERT.
 
-    [비즈니스 규칙]
-      * 누가 스크랩했는지는 추적하지 않는다 (요구사항: "인원수만").
-      * 원본 status 가 'Pending_Deletion' 이면 스크랩 불가 (UI 단에서 버튼 비활성).
+    [구조]
+      * RPC(do_scrap) 호출이 환경에 따라 auth.uid() 를 못 받는 케이스가 있어
+        이 함수에서 user_id 를 명시적으로 전달하며 직접 INSERT 한다.
+      * (user_id, project_id) UNIQUE 제약으로 중복 시 예외 발생 → 카운트 안 오름.
+      * 처음 INSERT 성공 시에만 projects.scrap_count += 1.
     """
+    user = ensure_authenticated() or {}
+    uid = user.get("id")
+    if not uid:
+        return "❌ 로그인이 필요합니다."
+
+    # 1) scraps 테이블에 (user_id, project_id) 직접 INSERT
+    try:
+        conn.table("scraps").insert(
+            {"user_id": uid, "project_id": source_project_id}
+        ).execute()
+    except Exception as e:
+        msg = str(e)
+        # UNIQUE 위반 = 이미 스크랩한 것 → 카운트 안 올림
+        if "duplicate" in msg.lower() or "23505" in msg or "unique" in msg.lower():
+            return "ℹ️ 이미 스크랩한 프로젝트입니다."
+        return f"❌ 스크랩 실패: {e}"
+
+    # 2) 처음 스크랩이면 projects.scrap_count 증가
     try:
         conn.table("projects").update(
             {"scrap_count": (current_scrap_count or 0) + 1}
         ).eq("id", source_project_id).execute()
-        return "✅ 스크랩 완료 (익명 카운트 +1)"
-    except Exception as e:
-        return f"❌ 스크랩 실패: {e}"
+    except Exception:
+        # 카운트 갱신 실패해도 스크랩 자체는 됐으니 성공으로 처리
+        pass
+
+    return "✅ 스크랩 완료 — 내 보관함에 저장됐습니다."
+
+
+def fetch_my_scrapped_projects(user_id: str | None, limit: int = 20) -> list[dict]:
+    """'내가 스크랩한' 프로젝트 목록 — scraps 조인.
+
+    남이 공유한 것(둘러보기) 과 구분되는, 내가 직접 담은 보관함.
+    """
+    if not user_id:
+        return []
+    try:
+        # 내 스크랩의 project_id 목록
+        sc = (
+            conn.table("scraps")
+            .select("project_id")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        pids = [r["project_id"] for r in (sc.data or []) if r.get("project_id")]
+        if not pids:
+            return []
+        resp = (
+            conn.table("projects")
+            .select(_PROJECT_SELECT)
+            .in_("id", pids)
+            .execute()
+        )
+        return resp.data or []
+    except Exception:
+        return []
 
 
 def request_project_deletion(project_id: str, created_at_iso: str, scrap_count: int) -> str:
@@ -1456,6 +1585,15 @@ def render_sidebar() -> None:
                 fetch_my_shared_projects(user.get("id"), limit=10),
                 key_prefix="mine",
             )
+            st.divider()
+
+            # 내가 스크랩(저장)한 것 — 남이 공유한 것과 명확히 구분되는 보관함
+            st.caption("📌 내가 스크랩한 보관함")
+            scrapped = fetch_my_scrapped_projects(user.get("id"), limit=10)
+            if scrapped:
+                _render_lineup(scrapped, key_prefix="scrap")
+            else:
+                st.caption("_(아직 스크랩한 항목이 없습니다)_")
             st.divider()
 
         st.caption("내가 공유받은(남이 공유한) 미리보기")
@@ -1566,12 +1704,24 @@ def _render_lineup(items: list[dict], key_prefix: str) -> None:
                         unsafe_allow_html=True,
                     )
                 st.caption(f"palette {len(colors)}color")
+                # 카드 제목: 피사체 라벨(있으면) + 광원 이름으로 의미있게 표시.
+                # (별도 title 컬럼 없이 기존 데이터로 라벨링)
+                _labels = proj.get("subject_labels") or []
+                _title = (
+                    (_labels[0] if _labels else None)
+                    or proj.get("_subject_label")
+                    or "프로젝트"
+                )
+                _created = (proj.get("created_at") or "")[:10]
                 if st.button(
-                    "Palette Title",
+                    f"{_title} · {_created}" if _created else _title,
                     key=f"{key_prefix}_open_{proj['id']}",
                     **_FW,
                 ):
-                    show_project_modal(proj, mode="view")
+                    try:
+                        show_project_modal(proj, mode="view")
+                    except Exception as e:
+                        st.error(f"미리보기 오류: {type(e).__name__}: {e}")
 
 
 # ---------- 중앙: 원본 이미지 + 태그 패널 ---------------------------------------
@@ -1633,6 +1783,32 @@ def _render_region_panel() -> None:
                 f"#{i + 1} · {label}  ·  {mask_info}",
                 expanded=(i == len(regions) - 1),
             ):
+                # ── 변환 스타일: 무지개(구조색) vs 단색 ──
+                style = st.radio(
+                    "변환 스타일",
+                    options=["무지개 (구조색 광택)", "단색 (광원 색조)"],
+                    index=0 if region.get("irid_mode", "iridescent") == "iridescent" else 1,
+                    key=f"irid_mode_radio_{i}",
+                    horizontal=True,
+                    help=(
+                        "무지개: 까마귀 깃털처럼 부위별로 파랑/보라/청록이 다르게 "
+                        "나타나는 영롱한 효과. 단색: 광원 색조를 평평하게 입힘."
+                    ),
+                )
+                region["irid_mode"] = (
+                    "iridescent" if style.startswith("무지개") else "flat"
+                )
+                if region["irid_mode"] == "iridescent":
+                    region["irid_boost"] = st.slider(
+                        "무지개 강도",
+                        min_value=2.0,
+                        max_value=14.0,
+                        value=float(region.get("irid_boost", 7.0)),
+                        step=0.5,
+                        key=f"irid_boost_{i}",
+                        help="클수록 색이 더 강하게 펼쳐집니다.",
+                    )
+
                 _render_mask_canvas_for_region(i, region)
                 if st.button("🗑️ 이 영역 삭제", key=f"del_region_{i}"):
                     regions.pop(i)
@@ -1781,6 +1957,55 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
     region["mask"] = mask_native.astype(bool)
 
 
+def _grabcut_foreground(
+    img_pil,
+    px1: int,
+    py1: int,
+    px2: int,
+    py2: int,
+    iters: int = 5,
+) -> "np.ndarray | None":
+    """사각형(px1,py1,px2,py2) 안에서 GrabCut 으로 전경(피사체)만 추출.
+
+    배경 제외의 핵심: 사용자가 사각형으로 새를 대충 감싸면, 그 안에서 OpenCV
+    GrabCut 이 색/질감 통계로 전경(새)과 배경(물/얼음)을 자동 분리한다.
+    반환: H×W bool 마스크 (전경 True) 또는 실패 시 None.
+    """
+    if cv2 is None or np is None:
+        return None
+    try:
+        arr = np.asarray(img_pil.convert("RGB"))
+        ih, iw = arr.shape[:2]
+        # 사각형이 너무 작으면 의미 없음
+        if (px2 - px1) < 8 or (py2 - py1) < 8:
+            return None
+        gc_mask = np.zeros((ih, iw), np.uint8)
+        bgd = np.zeros((1, 65), np.float64)
+        fgd = np.zeros((1, 65), np.float64)
+        rect = (px1, py1, px2 - px1, py2 - py1)
+        # 속도: 큰 이미지는 다운스케일해서 GrabCut 후 업스케일
+        scale = 1.0
+        work = arr
+        max_side = max(ih, iw)
+        if max_side > 600:
+            scale = 600.0 / max_side
+            work = cv2.resize(arr, (int(iw * scale), int(ih * scale)),
+                              interpolation=cv2.INTER_AREA)
+            gc_mask = np.zeros(work.shape[:2], np.uint8)
+            rect = (int(px1 * scale), int(py1 * scale),
+                    int((px2 - px1) * scale), int((py2 - py1) * scale))
+        cv2.grabCut(work, gc_mask, rect, bgd, fgd, iters, cv2.GC_INIT_WITH_RECT)
+        # GC_FGD(1) / GC_PR_FGD(3) 를 전경으로
+        fg = np.where((gc_mask == 1) | (gc_mask == 3), 1, 0).astype(np.uint8)
+        if scale != 1.0:
+            fg = cv2.resize(fg, (iw, ih), interpolation=cv2.INTER_NEAREST)
+        if fg.sum() == 0:
+            return None
+        return fg.astype(bool)
+    except Exception:
+        return None
+
+
 def _render_bbox_mask_fallback(
     region_index: int,
     region: dict,
@@ -1788,24 +2013,17 @@ def _render_bbox_mask_fallback(
     *,
     canvas_error: Exception | None = None,
 ) -> None:
-    """캔버스 마우스 트래킹이 동작하지 않을 때의 사각 영역 마스크 UI.
+    """사각 영역 마스크 UI + GrabCut 전경 자동 추출.
 
-    4개 슬라이더 (left / right / top / bottom %) 로 사각 영역을 지정하고,
-    해당 boolean 마스크를 `region['mask']` 에 저장한다. 시각 피드백을 위해
-    오렌지 오버레이 + 테두리가 그려진 미리보기를 함께 노출한다.
-
-    freedraw 가 아니라 사각형뿐인 점은 명확한 제약이며, 사용자가 보기에
-    "왜 안 칠해지나" 가 아니라 "이 영역에 매핑한다" 로 흐름이 보존된다.
+    1) 4개 슬라이더로 새를 대충 감싸는 사각형 지정
+    2) '윤곽 자동 추출(배경 제외)' 버튼 → GrabCut 으로 새만 분리
+    region['mask'] 에 boolean 마스크를 저장한다.
     """
     if Image is None or np is None:
         st.warning("Pillow / numpy 가 필요합니다 (requirements 설치).")
         return
 
     iw, ih = img_pil.size  # PIL: (W, H)
-
-    # ※ "캔버스 비호환이라 슬라이더로 대체" 안내 배너는 매 rerun 마다 노출되어
-    # 영역 expander 안에서 시각적 노이즈가 되므로 제거. 슬라이더 4개 자체가
-    # 충분히 자명한 UI 이며, 필요 시 설정 모달 진단 패널에서 추가 안내를 본다.
 
     bcols = st.columns(2)
     with bcols[0]:
@@ -1831,48 +2049,63 @@ def _render_bbox_mask_fallback(
     px1, px2 = int(iw * x1 / 100), int(iw * x2 / 100)
     py1, py2 = int(ih * y1 / 100), int(ih * y2 / 100)
 
-    mask = np.zeros((ih, iw), dtype=bool)
-    mask[py1:py2, px1:px2] = True
+    # ── GrabCut: 사각형 안에서 전경(새)만 자동 분리 → 배경 제외 ──
+    gc_key = f"grabcut_mask_{region_index}"
+    btn_cols = st.columns(2)
+    if btn_cols[0].button(
+        "✂️ 윤곽 자동 추출 (배경 제외)",
+        key=f"grabcut_btn_{region_index}",
+        help="사각형 안에서 피사체만 자동으로 따냅니다 (배경/물/얼음 제외).",
+        disabled=(cv2 is None),
+    ):
+        with st.spinner("피사체 윤곽 추출 중…"):
+            fg = _grabcut_foreground(img_pil, px1, py1, px2, py2)
+        if fg is not None:
+            st.session_state[gc_key] = fg
+            st.toast("윤곽 추출 완료 — 배경이 제외됩니다.")
+        else:
+            st.session_state.pop(gc_key, None)
+            st.warning("윤곽 추출 실패 — 사각형을 더 크게/명확하게 잡아보세요.")
+    if btn_cols[1].button(
+        "↩️ 사각형으로 되돌리기",
+        key=f"grabcut_reset_{region_index}",
+        help="자동 추출을 취소하고 사각형 전체를 마스크로 사용합니다.",
+    ):
+        st.session_state.pop(gc_key, None)
+
+    gc_mask = st.session_state.get(gc_key)
+
+    # 최종 마스크 결정: GrabCut 결과가 있으면 그걸, 없으면 사각형 전체
+    if gc_mask is not None and gc_mask.shape == (ih, iw):
+        mask = gc_mask
+        mask_kind = "윤곽(배경 제외)"
+    else:
+        mask = np.zeros((ih, iw), dtype=bool)
+        mask[py1:py2, px1:px2] = True
+        mask_kind = "사각형"
     region["mask"] = mask
 
-    # 시각 피드백 — 반투명 오버레이 + 테두리
-    arr = np.asarray(img_pil.convert("RGB")).copy()
+    # 시각 피드백 — 마스크 영역에 반투명 오렌지 오버레이
+    arr = np.asarray(img_pil.convert("RGB")).copy().astype(np.float32)
     overlay_color = np.array([255, 165, 0], dtype=np.float32)
-    region_slice = arr[py1:py2, px1:px2].astype(np.float32)
-    blended = np.clip(region_slice * 0.55 + overlay_color * 0.45, 0, 255).astype(np.uint8)
-    arr[py1:py2, px1:px2] = blended
-    border_w = max(2, int(min(iw, ih) * 0.004))
-    arr[py1:py1 + border_w, px1:px2] = overlay_color
-    arr[py2 - border_w:py2, px1:px2] = overlay_color
-    arr[py1:py2, px1:px1 + border_w] = overlay_color
-    arr[py1:py2, px2 - border_w:px2] = overlay_color
-
-    st.image(Image.fromarray(arr), **_FW)
+    sel = mask
+    arr[sel] = np.clip(arr[sel] * 0.55 + overlay_color * 0.45, 0, 255)
+    st.image(Image.fromarray(arr.astype(np.uint8)), **_FW)
     st.caption(
-        f"마스크 영역: {(x2 - x1)}% × {(y2 - y1)}%  "
-        f"({px2 - px1} × {py2 - py1} px = {int(mask.sum())} 픽셀)"
+        f"마스크: {mask_kind} · {int(mask.sum())} 픽셀 "
+        f"({int(mask.sum()) * 100 // (iw * ih)}% 영역)"
     )
 
-    # ── 캔버스가 왜 폴백됐는지 진단 (영역 expander 안에서 호출되므로 expander
-    #    중첩 금지 — st.expander 대신 일반 container 로 표시한다) ──
+    # 진단 (canvas_error 있을 때만, expander 중첩 금지 → container)
     if canvas_error is not None:
         with st.container(border=True):
             st.caption("🔧 캔버스 진단 (왜 슬라이더로 폴백?)")
             st.code(f"streamlit: {st.__version__}", language="text")
-            try:
-                import streamlit_drawable_canvas as _sdc  # type: ignore
-                sdc_ver = getattr(_sdc, "__version__", "(unknown)")
-                st.code(f"streamlit-drawable-canvas: {sdc_ver}", language="text")
-            except Exception as e:
-                st.code(
-                    f"streamlit-drawable-canvas: import 실패 — "
-                    f"{type(e).__name__}: {e}",
-                    language="text",
-                )
             st.code(
                 f"canvas 호출 예외: {type(canvas_error).__name__}: {canvas_error}",
                 language="text",
             )
+    return
 
 
 def _render_illuminant_tag_grid() -> None:
@@ -1941,6 +2174,35 @@ def render_5x10_grid() -> None:
 
 
 # ---------- 중앙↔우측 사이의 세로 버튼 컬럼 -------------------------------------
+def _reset_workspace(keep_login: bool = True) -> None:
+    """작업 상태(이미지/영역/광원/결과)를 비운다. 로그인 세션은 유지.
+
+    이미지나 태그를 바꾸려 할 때 새로고침+재로그인 없이 깨끗이 초기화한다.
+    """
+    clear_keys = [
+        SS_ORIGIN_IMAGE, SS_ORIGIN_BYTES, SS_RESULT_BYTES, SS_MATRIX,
+        SS_BASE_COLORS, SS_TILE_GRID, SS_SELECTED_ILLU, SS_REGIONS,
+        "_last_upload_name",
+    ]
+    for k in clear_keys:
+        st.session_state.pop(k, None)
+
+    # 위젯 상태(업로더/캔버스/슬라이더/검색 등)도 정리 — 잔여 키가 남으면
+    # 새 이미지에 옛 마스크/슬라이더가 따라붙는다. 접두사로 일괄 제거.
+    prefixes = (
+        "uploader", "canvas_region_", "use_canvas_", "stroke_",
+        "bbox_x1_", "bbox_x2_", "bbox_y1_", "bbox_y2_",
+        "irid_mode_radio_", "irid_boost_", "subject_search",
+        "illu_", "add_region_", "del_region_",
+    )
+    for k in list(st.session_state.keys()):
+        if any(str(k).startswith(p) for p in prefixes):
+            st.session_state.pop(k, None)
+
+    if not keep_login:
+        st.session_state.pop(SS_AUTH_USER, None)
+
+
 def render_action_buttons() -> None:
     """Upload → Convert → Finish 세로 버튼.
 
@@ -1989,6 +2251,19 @@ def render_action_buttons() -> None:
         help=convert_help,
     ):
         _run_convert_multi(regions, illu)
+
+    st.write("")
+
+    # ----- 비우기 (이미지/태그/결과 초기화 · 로그인 유지) -----
+    if st.button(
+        "🗑️ 비우기",
+        **_FW,
+        help="이미지·영역·광원·결과를 모두 지웁니다. 로그인은 유지됩니다.",
+        disabled=not (has_image or has_region or has_illu),
+    ):
+        _reset_workspace(keep_login=True)
+        st.toast("작업 공간을 비웠습니다.")
+        st.rerun()
 
     st.write("")
 
@@ -2107,7 +2382,11 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
 
             try:
                 transformed = apply_false_color_array(
-                    img, target["rgb"], strength=1.0
+                    img,
+                    target["rgb"],
+                    strength=1.0,
+                    mode=region.get("irid_mode", "iridescent"),
+                    sat_boost=float(region.get("irid_boost", 7.0)),
                 )
             except NotImplementedError:
                 st.error("PHASE 3 (numpy 변환) 의존성이 미설치 상태입니다.")
@@ -2245,11 +2524,30 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
     left, right = st.columns([1, 1])
     with left:
         st.markdown("**원본 이미지**")
+        shown = False
         if is_share and project.get("_origin_bytes"):
-            st.image(project["_origin_bytes"], **_FW)
+            try:
+                st.image(project["_origin_bytes"], **_FW)
+                shown = True
+            except Exception:
+                shown = False
         elif project.get("origin_path"):
-            st.image(project["origin_path"], **_FW)
-        else:
+            op = project["origin_path"]
+            # local:// placeholder 는 실제 파일이 아니므로 st.image 가 터진다.
+            # (Storage 버킷 미설정 시 저장된 가짜 경로) → 안내 문구로 대체.
+            if isinstance(op, str) and op.startswith("local://"):
+                st.info(
+                    "이미지가 클라우드(Storage)에 업로드되지 않았습니다. "
+                    "Supabase Storage 에 'originals'·'results' 버킷(Public)을 "
+                    "만들면 이미지가 표시됩니다."
+                )
+            else:
+                try:
+                    st.image(op, **_FW)
+                    shown = True
+                except Exception:
+                    st.caption("(이미지를 불러올 수 없습니다)")
+        if not shown and not (project.get("origin_path") or project.get("_origin_bytes")):
             st.caption("(원본 이미지 없음)")
 
     with right:
@@ -2300,7 +2598,17 @@ def show_project_modal(project: dict, mode: str = "view") -> None:
         (project.get("created_at") or "")[:10] or "—",
     )
 
-    creator = "익명의 창작자" if project.get("is_anonymous") else (project.get("owner_id") or "—")
+    if project.get("is_anonymous"):
+        creator = "익명의 창작자"
+    else:
+        # owner_id(UUID) 대신 profiles.nickname 표시. 뷰가 있으면 이미 들어있고,
+        # 없으면 owner_id 로 profiles 조회. 둘 다 실패하면 UUID 앞부분만.
+        creator = project.get("owner_nickname")
+        if not creator:
+            creator = _lookup_nickname(project.get("owner_id"))
+        if not creator:
+            oid = project.get("owner_id") or ""
+            creator = (oid[:8] + "…") if oid else "—"
     st.caption(f"제작자: {creator}")
 
     # ---- 모드별 추가 액션 ----
@@ -2402,6 +2710,26 @@ def _lookup_label(table: str, row_id: str | None, name_col: str = "label") -> st
         )
         if resp.data:
             return resp.data[0].get(name_col)
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _lookup_nickname(owner_id: str | None) -> str | None:
+    """owner_id(UUID) → profiles.nickname. 제작자 표시용 (UUID 노출 방지)."""
+    if not owner_id:
+        return None
+    try:
+        resp = (
+            conn.table("profiles")
+            .select("id, nickname")
+            .eq("id", owner_id)
+            .limit(1)
+            .execute()
+        )
+        if resp.data:
+            return resp.data[0].get("nickname")
     except Exception:
         pass
     return None
