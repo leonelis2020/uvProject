@@ -349,18 +349,105 @@ def validate_matrix_payload(payload: Any) -> bool:
 
 
 _MATRIX_SYSTEM_PROMPT = (
-    "You are a color-science assistant. Given a target subject's spectral reflectance "
-    "(typically 300–700 nm, 41 points, scaled 0–1) and an illuminant's spectral power "
-    "distribution (SPD), produce a 3x4 affine RGB color transformation matrix that "
-    "simulates how the subject would appear under the given illuminant when its UV/IR "
-    "reflectance is translated into the visible sRGB band.\n\n"
+    "You are a color-science assistant performing UV / non-standard illumination "
+    "photography simulation. Input per request:\n"
+    "- subject: spectral reflectance over 300–700 nm (~41 points, 0–1), plus an "
+    "  `is_uv_active` flag — TRUE means the subject fluoresces under UV light.\n"
+    "- illuminant: spectral power distribution (SPD) of the light source plus a "
+    "  human-readable `name` such as 'UV-A', 'Sunrise', 'D65'.\n\n"
+    "Compute a 3x4 affine RGB matrix M that, when applied as "
+    "`out = M @ [r, g, b, 1.0]` to each pixel of an ordinary daylight photo of the "
+    "subject, SIMULATES how it would appear under the supplied illuminant.\n\n"
+    "Concrete scenario behaviour you MUST follow:\n\n"
+    "1. UV-A 'black light' (illuminant.name == 'UV-A' OR SPD dominated by 300–400 nm "
+    "   with little 400–700 nm energy):\n"
+    "   * Drastically REDUCE the visible-band response — diagonals around 0.10–0.35, "
+    "     NOT 1.0. The scene should look much darker than daylight.\n"
+    "   * Apply a strong VIOLET / DEEP-BLUE cast: blue channel coefficients should "
+    "     dominate (b row roughly [0.10, 0.15, 0.85, 0.10]) and red/green should "
+    "     contribute partial blue via cross-channel terms (r row roughly "
+    "     [0.20, 0.05, 0.30, 0.05], g row roughly [0.05, 0.20, 0.25, 0.05]).\n"
+    "   * If subject is_uv_active=TRUE, add a positive bias to whichever visible "
+    "     channel approximates the subject's fluorescence emission (typically GREEN "
+    "     or RED bias around +0.10–0.20) so painted regions visibly POP.\n\n"
+    "2. Sunrise / Sunset (warm SPD heavy in 580–700 nm):\n"
+    "   * Boost red, slightly boost green, suppress blue. Example: r ≈ "
+    "     [1.25, 0.10, 0.00, 0.08], g ≈ [0.05, 0.95, 0.00, 0.02], b ≈ "
+    "     [0.00, 0.00, 0.55, -0.05].\n\n"
+    "3. D65 standard daylight: stays close to identity but slightly cooler — "
+    "   diagonals near 0.95–1.05, not exactly 1.0.\n\n"
+    "HARD RULES (violation = failure):\n"
+    "- You MUST NOT return the exact identity matrix "
+    '{"r":[1,0,0,0],"g":[0,1,0,0],"b":[0,0,1,0]}. That value is reserved as the '
+    "calling code's 'unknown' fallback and would render the original photo "
+    "unchanged.\n"
+    "- Make a physically-motivated estimate even with limited data. Bias toward a "
+    "visibly noticeable transformation: a slightly wrong but visible result is "
+    "preferable to a perfect-but-invisible one.\n\n"
     "Return STRICT JSON ONLY (no prose, no markdown fences) with this exact shape:\n"
     '{"r":[r0,r1,r2,bias],"g":[g0,g1,g2,bias],"b":[b0,b1,b2,bias]}\n\n'
-    "All twelve values are floats in [-2.0, 2.0]. The matrix is applied to the "
-    "homogeneous pixel vector [r, g, b, 1] in sRGB float [0, 1] as out = M @ [r,g,b,1]. "
-    "If you have low confidence, return values close to the identity matrix "
-    "(diagonals ≈ 1, off-diagonals ≈ 0, bias ≈ 0)."
+    "All twelve values are floats in [-2.0, 2.0]."
 )
+
+
+# 결정론적 illuminant 폴백 — AI 가 identity 만 뱉을 때 시각적 변화를 보장하기 위함.
+# 이름을 lower() 비교하므로 'uv-a', 'UV-A', 'uva' 모두 매칭.
+_ILLUMINANT_FALLBACK_MATRICES: dict[str, dict] = {
+    "uv-a": {
+        # Black light 가상 — 어둡고 보랏빛, 마젠타 풍의 결과.
+        "r": [0.20, 0.05, 0.30, 0.05],
+        "g": [0.05, 0.20, 0.25, 0.05],
+        "b": [0.10, 0.15, 0.85, 0.10],
+    },
+    "sunrise": {
+        # 일출 — 따뜻한 오렌지 캐스트.
+        "r": [1.25, 0.10, 0.00, 0.08],
+        "g": [0.05, 0.95, 0.00, 0.02],
+        "b": [0.00, 0.00, 0.55, -0.05],
+    },
+    "sunset": {
+        # 일몰 — 일출보다 더 붉음.
+        "r": [1.35, 0.12, 0.00, 0.12],
+        "g": [0.08, 0.88, 0.00, 0.00],
+        "b": [0.00, 0.00, 0.45, -0.10],
+    },
+    "d65": {
+        # 표준 주광 — 거의 동등하지만 살짝 cooler. (완벽한 항등을 피한다)
+        "r": [0.95, 0.00, 0.05, 0.00],
+        "g": [0.00, 1.00, 0.00, 0.00],
+        "b": [0.00, 0.00, 1.05, 0.00],
+    },
+}
+
+
+def _illuminant_fallback(illu_name: str | None) -> dict:
+    """illuminant 이름 기반 결정론적 행렬. 매칭 실패 시 약한 violet bias 반환.
+
+    `call_gpt4o_mini_for_matrix` 의 최종 폴백 — IDENTITY 를 직접 반환하지 않고
+    이걸 호출하면 사용자에게 '아무것도 안 바뀜' 보다는 시각적 단서가 남는다.
+    """
+    key = (illu_name or "").strip().lower()
+    if key in _ILLUMINANT_FALLBACK_MATRICES:
+        return dict(_ILLUMINANT_FALLBACK_MATRICES[key])
+    # 알 수 없는 illuminant — 미약한 cool/violet 캐스트 (식별 가능한 변화)
+    return {
+        "r": [0.85, 0.00, 0.10, 0.00],
+        "g": [0.00, 0.90, 0.05, 0.00],
+        "b": [0.05, 0.05, 1.00, 0.05],
+    }
+
+
+def _is_exact_identity(payload: dict) -> bool:
+    """payload 가 정확히 IDENTITY 행렬인지 (AI 가 hedging 으로 안전한 답을
+    내놓은 케이스를 거르기 위함)."""
+    try:
+        return (
+            list(payload.get("r", [])) == [1.0, 0.0, 0.0, 0.0]
+            and list(payload.get("g", [])) == [0.0, 1.0, 0.0, 0.0]
+            and list(payload.get("b", [])) == [0.0, 0.0, 1.0, 0.0]
+        )
+    except Exception:
+        return False
 
 
 def _record_openai_diag(**kv) -> None:
@@ -374,8 +461,8 @@ def _record_openai_diag(**kv) -> None:
 def call_gpt4o_mini_for_matrix(
     rag_context: dict,
     *,
-    max_retries: int = 1,
-    temperature: float = 0.2,
+    max_retries: int = 2,
+    temperature: float = 0.3,
 ) -> dict:
     """GPT-4o-mini 호출 → 3x4 변환 행렬 JSON. **이미지는 전달하지 않는다.**
 
@@ -452,18 +539,26 @@ def call_gpt4o_mini_for_matrix(
                 last_err = "empty response content"
                 continue
             payload = json.loads(content)
-            if validate_matrix_payload(payload):
-                _record_openai_diag(
-                    stage="ok",
-                    ok=True,
-                    detail=(
-                        f"매트릭스 수신 OK (시도 {attempt + 1}/{max_retries + 1})"
-                    ),
-                    raw_preview=last_raw,
-                    model="gpt-4o-mini",
-                )
-                return payload
-            last_err = "schema validation failed"
+            if not validate_matrix_payload(payload):
+                last_err = "schema validation failed"
+                continue
+            # ─── 모델이 안전책으로 IDENTITY 만 뱉었으면 거부하고 재시도. ──
+            # 시스템 프롬프트가 명시적으로 금지하지만 gpt-4o-mini 가 종종
+            # 무시한다. validate 단계에서 한 번 더 거른다.
+            if _is_exact_identity(payload):
+                last_err = "model returned exact identity (rejected)"
+                last_raw = content[:200]
+                continue
+            _record_openai_diag(
+                stage="ok",
+                ok=True,
+                detail=(
+                    f"매트릭스 수신 OK (시도 {attempt + 1}/{max_retries + 1})"
+                ),
+                raw_preview=last_raw,
+                model="gpt-4o-mini",
+            )
+            return payload
         except json.JSONDecodeError as e:
             last_err = f"json decode: {e}"
             continue
@@ -472,16 +567,23 @@ def call_gpt4o_mini_for_matrix(
             last_err = f"{type(e).__name__}: {e}"
             continue
 
+    # ─── 모든 시도가 실패하거나 IDENTITY 만 받았다면 결정론적 폴백 ────────
+    # IDENTITY 를 그대로 반환하면 결과 이미지가 원본과 100% 동일해 사용자가
+    # "AI 가 정말 호출됐나" 를 판단할 수 없다. illuminant 이름 기반 합리적
+    # 행렬을 반환해 시각적 단서를 남긴다.
+    illu_name = (rag_context.get("illuminant") or {}).get("name")
+    fallback = _illuminant_fallback(illu_name)
     _record_openai_diag(
         stage="failed",
         ok=False,
         detail=(
-            f"모든 시도 실패 (총 {max_retries + 1}회). 마지막 에러: {last_err}"
+            f"모든 시도 실패 (총 {max_retries + 1}회). 마지막 에러: {last_err}. "
+            f"illuminant='{illu_name}' 기반 결정론적 폴백 사용."
         ),
         raw_preview=last_raw,
         model="gpt-4o-mini",
     )
-    return dict(IDENTITY)
+    return fallback
 
 
 # Backward-compat alias — 기존에 이미지 인자를 받던 시그니처가 코드 어딘가에 박혀있을 수
