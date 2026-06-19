@@ -1575,9 +1575,18 @@ def render_tag_panel() -> None:
     st.markdown("**Tags**")
     tabs = st.tabs(["🦆 피사체 영역 (Subject · N개)", "💡 광원 (Illuminant · 5)"])
     with tabs[0]:
-        _render_region_panel()
+        # [버그픽스] 피사체 패널에서 예외가 나도 광원 탭/하위 UI 가 통째로
+        # 사라지지 않도록 격리한다. (과거: 영역 추가 시 캔버스 렌더 실패가
+        # 스크립트 전체를 중단시켜 광원 선택이 불가능해지던 증상)
+        try:
+            _render_region_panel()
+        except Exception as e:  # pragma: no cover - defensive
+            st.error(f"피사체 영역 패널 오류: {type(e).__name__}: {e}")
     with tabs[1]:
-        _render_illuminant_tag_grid()
+        try:
+            _render_illuminant_tag_grid()
+        except Exception as e:  # pragma: no cover - defensive
+            st.error(f"광원 패널 오류: {type(e).__name__}: {e}")
     st.caption("Orange: Selected · Gray: Not Selected · 같은 광원 아래 여러 영역에 다른 피사체를 매핑합니다.")
 
 
@@ -1668,14 +1677,45 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
     if img_pil is None:
         st.caption("먼저 좌측 'Upload' 로 이미지를 업로드하세요.")
         return
-    if cv2 is None or np is None:
-        st.warning("opencv-python-headless / numpy 가 필요합니다 (requirements 설치).")
+    if np is None:
+        st.warning("numpy 가 필요합니다 (requirements 설치).")
         return
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # [버그픽스] 기본 마스킹 경로 = bbox 슬라이더 (항상 안전).
+    #
+    # 과거: st_canvas 를 먼저 호출하고 예외 시 폴백 → 그러나 streamlit-drawable-
+    # canvas 가 현재 Streamlit 버전과 비호환일 때, 호출이 '파이썬 예외' 가 아니라
+    # 위젯 렌더링 단계에서 스크립트 실행을 중단시켜 try/except 로 못 잡고 그 아래
+    # (광원 탭 / Convert 버튼 / 결과 패널) 전체가 사라지는 치명적 증상이 있었다.
+    #
+    # 해결: bbox 슬라이더를 기본으로 항상 렌더링하고, freedraw 캔버스는 사용자가
+    # 체크박스로 명시적으로 켤 때만 시도한다. import 와 호출을 모두 가드해
+    # 어떤 경우에도 패널 하단이 죽지 않도록 한다.
+    # ─────────────────────────────────────────────────────────────────────────
+    use_canvas = st.checkbox(
+        "🖌️ 자유곡선(freedraw) 캔버스 사용 (실험적 · 환경에 따라 비활성)",
+        value=False,
+        key=f"use_canvas_{region_index}",
+        help=(
+            "체크 해제 시 사각 영역 슬라이더로 마스킹합니다(권장 · 항상 동작). "
+            "캔버스는 streamlit-drawable-canvas 호환 환경에서만 동작합니다."
+        ),
+    )
+
+    if not use_canvas:
+        _render_bbox_mask_fallback(region_index, region, img_pil)
+        return
+
+    # ── 캔버스 옵트인 경로 ──
+    if cv2 is None:
+        st.warning("opencv-python-headless 가 필요합니다 → 슬라이더 마스킹으로 진행합니다.")
+        _render_bbox_mask_fallback(region_index, region, img_pil)
+        return
     try:
         from streamlit_drawable_canvas import st_canvas
-    except Exception:
-        st.warning("`streamlit-drawable-canvas` 가 설치되지 않았습니다. (requirements 설치 필요)")
+    except Exception as exc:
+        _render_bbox_mask_fallback(region_index, region, img_pil, canvas_error=exc)
         return
 
     iw, ih = img_pil.size  # PIL: (W, H)
@@ -1704,11 +1744,7 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
             key=f"canvas_region_{region_index}",
         )
     except Exception as exc:
-        # 어떤 예외든 bbox 슬라이더 폴백으로 전환한다. 이전엔 예외를 완전히
-        # 숨겼는데, 그 결과 사용자가 "왜 캔버스가 안 보이지?" 를 진단할 방법이
-        # 없었다. 폴백 안에 접힌 진단 expander 로 streamlit / canvas 버전과
-        # 실제 예외를 노출한다 (rerun 누적 노이즈는 expander 가 접혀 있어
-        # 발생하지 않음).
+        # 캔버스 호출이 예외로 끝나면 슬라이더 폴백으로 전환 (진단 expander 포함).
         _render_bbox_mask_fallback(region_index, region, img_pil, canvas_error=exc)
         return
 
