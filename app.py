@@ -125,6 +125,39 @@ def _get_openai_key() -> str | None:
         return None
 
 
+def _format_openai_error_hint(err_str: str | None) -> str | None:
+    """OpenAI 호출 실패 메시지를 사용자가 바로 행동할 수 있는 한 줄로 변환.
+
+    설정 모달의 진단 패널이 `detail` 필드를 그대로 보여주는 것에 더해, 자주
+    걸리는 패턴(잔액 부족 / 키 무효 / 레이트 리밋) 일 때만 따로 강조해 준다.
+    매칭 안 되면 `None` 을 반환해 힌트를 표시하지 않는다.
+    """
+    if not err_str:
+        return None
+
+    # OpenAI 잔액 부족 (insufficient_quota) — 429 와 함께 옴.
+    # rate_limit (단순 분당 제한) 과 분리해서 안내해야 한다: 결제 추가 vs 대기.
+    if "insufficient_quota" in err_str:
+        return (
+            "💳 OpenAI 계정 **크레딧 부족** (insufficient_quota).\n"
+            "https://platform.openai.com/settings/organization/billing 에서 "
+            "결제 수단을 추가하고 **최소 $5 크레딧 충전** 이 필요합니다. "
+            "(현재 Usage 페이지에 Total Spend $0.00 이 보이는 이유이며, "
+            "API 호출이 quota 검사 단계에서 차단되어 모델까지 도달하지 못함)"
+        )
+    if "invalid_api_key" in err_str or "Incorrect API key" in err_str:
+        return (
+            "🔑 API 키가 **유효하지 않음** — `.streamlit/secrets.toml` 의 "
+            "`[openai] api_key` 가 올바른 `sk-...` 형식인지 다시 확인하세요."
+        )
+    # insufficient_quota 와 분리: 잔액은 있으나 분당 호출량 초과.
+    if "rate_limit" in err_str.lower() and "insufficient_quota" not in err_str:
+        return "⏳ OpenAI **레이트 리밋** — 잠시 후 다시 시도하세요."
+    if "401" in err_str:
+        return "🔐 인증 실패 (401) — API 키가 만료/취소되었거나 다른 조직 키입니다."
+    return None
+
+
 def _openai_key_info() -> dict:
     """진단용 — 키의 출처(env/secrets/없음) + 길이 + 마스킹된 미리보기."""
     src = None
@@ -1840,6 +1873,10 @@ def show_settings_modal() -> None:
             st.text(f"{kind} stage: {diag.get('stage')}  ({diag.get('ts', '-')})")
             if diag.get("detail"):
                 st.text(f"detail: {diag['detail']}")
+            # 자주 걸리는 패턴은 한 줄로 강조 (insufficient_quota 등).
+            hint = _format_openai_error_hint(diag.get("detail"))
+            if hint:
+                st.warning(hint)
             if diag.get("raw_preview"):
                 st.code(diag["raw_preview"], language="json")
 
