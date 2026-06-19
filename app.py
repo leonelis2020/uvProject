@@ -302,10 +302,133 @@ def handle_image_upload(uploaded_file) -> None:
 
 
 # =============================================================================
-# PHASE 2: AI SIMULATION  —  RAG + GPT-4o-mini (텍스트 JSON 전용)
-#   - reflectance.spectral_values + illuminant.spd_data 만 프롬프트에 결합
-#   - 이미지는 보내지 않음 (저비용 + 환각 방지)
-#   - GPT-4o-mini 호출 → 3x4 변환 행렬(JSON) 수신 및 스키마 검증
+# PHASE 2-SPECTRAL: UV FALSE-COLOR 변환 코어 (AI/GPT 제거 · 순수 numpy)
+# -----------------------------------------------------------------------------
+#   설계 변경 (v3 — GPT 폐기):
+#     기존엔 GPT-4o-mini 가 광원 '이름' 만 보고 3x4 행렬을 '추측' 했다. 그 결과
+#     SPD 숫자값이 결과에 반영되지 않고, UV-A 가 무조건 보라색으로 하드코딩됐다.
+#
+#     이제는 GPT 를 호출하지 않고, 분광 반사율 R(λ) × 광원 SPD S(λ) 를 직접
+#     적분해 4개 대역(UV/Blue/Green/Red) 신호를 만들고, 이를 가시광 3채널로
+#     시프트 매핑(UV→B, B→G, G→R)한다 → "false-color UV" (네온 형광이 아니라
+#     반사율 기반 무지개). 광원 5종의 SPD 차이가 결과를 물리적으로 결정한다.
+#
+#     - UVA_365 처럼 가시광 에너지가 0 인 블랙라이트 → UV 대역만 살아 거의 단색
+#       파랑. (형광이 없으면 깜깜한 게 물리적으로 옳다.)
+#     - D65/Halogen/LED/F11 은 SPD 모양에 따라 각각 다른 색조로 갈린다.
+#
+#   기존 함수(call_gpt4o_*, _MATRIX_SYSTEM_PROMPT, apply_matrix_array 등)는
+#   하위 호환을 위해 정의만 남겨두되, 변환 경로(_run_convert_multi)에서는 더 이상
+#   호출하지 않는다.
+# =============================================================================
+
+# 41포인트 파장 그리드 (300–700nm, 10nm) — spectral_values / spd_data 와 동일 격자
+WAVELENGTHS = list(range(300, 701, 10))
+
+
+def spectrum_to_array(spec: dict | None, fill: float = 0.0) -> "np.ndarray":
+    """{"300": 0.08, ...} (str/int 키 혼용 허용) → 41-길이 float 배열. 누락은 fill."""
+    if np is None:
+        raise NotImplementedError("numpy 미설치")
+    out = np.full(len(WAVELENGTHS), fill, dtype=np.float64)
+    if not spec:
+        return out
+    for i, wl in enumerate(WAVELENGTHS):
+        v = spec.get(str(wl), spec.get(wl))
+        if v is not None:
+            try:
+                out[i] = float(v)
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def _band_masks() -> dict:
+    """UV / Blue / Green / Red 4대역의 파장 인덱스 마스크."""
+    wl = np.array(WAVELENGTHS)
+    return {
+        "UV":    (wl >= 300) & (wl < 400),   # 300–390
+        "BLUE":  (wl >= 400) & (wl < 500),   # 400–490
+        "GREEN": (wl >= 500) & (wl < 600),   # 500–590
+        "RED":   (wl >= 600) & (wl <= 700),  # 600–700
+    }
+
+
+def compute_false_color_target(
+    reflectance: dict | None,
+    spd: dict | None,
+    is_uv_active: bool = False,
+) -> dict:
+    """피사체 1종 × 광원 1개 → false-color 기준 RGB(0–1) + 진단.
+
+    매핑:  Blue_out ← UV,  Green_out ← Blue,  Red_out ← Green  (Red 대역은 약하게만)
+    광원 정규화: 가시광(400–700) 총에너지를 1로 → 밝기차 제거, 색조만 비교.
+      (UVA_365 처럼 가시광 0 인 광원은 정규화되지 않아 UV 대역만 살아남는다.)
+    """
+    if np is None:
+        raise NotImplementedError("numpy 미설치")
+    R = spectrum_to_array(reflectance, fill=0.0)
+    S = spectrum_to_array(spd, fill=0.0)
+
+    wl = np.array(WAVELENGTHS)
+    vis = wl >= 400
+    vis_energy = S[vis].sum()
+    if vis_energy > 1e-9:
+        S = S / vis_energy
+
+    reflected = R * S
+    masks = _band_masks()
+
+    def band(m):
+        sel = reflected[m]
+        return float(sel.mean()) if sel.size else 0.0
+
+    bands = {name: band(m) for name, m in masks.items()}
+
+    r_out = bands["GREEN"] + bands["RED"] * 0.25
+    g_out = bands["BLUE"]
+    b_out = bands["UV"]
+
+    # 형광 피사체가 UV-only 환경일 때만 녹색 끼 살짝 (emission 컬럼 생기면 교체)
+    if is_uv_active and bands["UV"] > 0 and (bands["BLUE"] + bands["GREEN"]) < 1e-6:
+        g_out += bands["UV"] * 0.15
+
+    rgb = np.array([r_out, g_out, b_out], dtype=np.float64)
+    peak = rgb.max()
+    if peak > 1e-9:
+        rgb = rgb / peak  # 색조 유지 정규화 (밝기는 apply 단계서 원본 luma 로 입힘)
+    rgb = np.clip(rgb, 0.0, 1.0)
+
+    total = sum(bands.values()) or 1e-9
+    return {"rgb": rgb.tolist(), "bands": bands, "uv_fraction": bands["UV"] / total}
+
+
+def apply_false_color_array(
+    img: "np.ndarray",
+    target_rgb,
+    strength: float = 1.0,
+) -> "np.ndarray":
+    """H×W×3 [0,1] 원본을 target_rgb 색조로 리컬러. 원본 luma(명암 디테일) 보존.
+
+    멀티리전 합성에서 영역마다 target_rgb / strength 를 바꿔 반복 호출한다.
+    `apply_matrix_array` 의 대체 단위 함수 (배열 in/out).
+    """
+    if np is None:
+        raise NotImplementedError("numpy 미설치")
+    target = np.asarray(target_rgb, dtype=np.float32).reshape(1, 1, 3)
+    luma = (
+        0.2126 * img[..., 0] + 0.7152 * img[..., 1] + 0.0722 * img[..., 2]
+    )[..., None]
+    recolored = np.clip(luma * target * 1.6, 0.0, 1.0)  # ×1.6: luma×tint 어두움 보정
+    out = img * (1.0 - strength) + recolored * strength
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+# =============================================================================
+# PHASE 2: AI SIMULATION  —  [DEPRECATED · 미사용]
+#   ↓ 아래 GPT-4o-mini 경로는 v3 에서 변환에 더 이상 사용되지 않는다.
+#     함수 정의는 하위 호환(외부 import) 을 위해 남겨두지만, _run_convert_multi
+#     는 compute_false_color_target / apply_false_color_array 만 호출한다.
 # =============================================================================
 
 EXPECTED_MATRIX_KEYS = {"r", "g", "b"}
@@ -1884,28 +2007,46 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
     matrices_for_session: list[dict] = []
     fallback_count = 0
 
-    with st.spinner(f"GPT-4o-mini 호출 × {len(regions)} 영역…"):
+    # 광원 SPD 는 이미지 전체 1개 공통 (사진 한 장 = 한 조명).
+    spd = (illu or {}).get("spd_data")
+
+    with st.spinner(f"UV false-color 변환 × {len(regions)} 영역…"):
         for region in regions:
             subj = region.get("subject") or {}
-            ctx = build_rag_context(subj, illu)
+            reflectance = subj.get("spectral_values")
+            is_uv_active = bool(subj.get("is_uv_active"))
+
+            # ── 분광 반사율 × 광원 SPD → false-color 기준색 (GPT 호출 없음) ──
+            # 반사율이 없는 영역만 변환 불가로 간주해 원본 유지(부분 실패 격리).
             try:
-                # call_gpt4o_mini_for_matrix 는 키 부재/네트워크 오류 시
-                # 예외를 던지지 않고 IDENTITY 를 반환한다. 따라서 여기서는
-                # 진짜 예외(런타임 에러)만 잡아내면 충분하다.
-                matrix = call_gpt4o_mini_for_matrix(ctx)
+                target = compute_false_color_target(reflectance, spd, is_uv_active)
             except Exception as e:  # pragma: no cover - defensive
-                st.warning(f"AI 호출 실패 ({subj.get('label')}): {e} → IDENTITY 로 진행.")
-                matrix = dict(IDENTITY)
-
-            if not validate_matrix_payload(matrix):
-                matrix = dict(IDENTITY)
+                st.warning(
+                    f"변환 실패 ({subj.get('label')}): {e} → 원본 유지."
+                )
                 fallback_count += 1
+                continue
 
-            region["matrix"] = matrix
-            matrices_for_session.append(matrix)
+            if not reflectance:
+                # 분광 데이터 없는 피사체 — 칠하지 않고 원본 유지
+                fallback_count += 1
+                continue
+
+            # region 호환 필드: 기존 스키마(_matrix/matrix)와의 연속성을 위해
+            # 산출한 target RGB 와 대역 진단을 region["matrix"] 에 dict 로 보관한다.
+            region_payload = {
+                "target_rgb": target["rgb"],
+                "bands": target["bands"],
+                "uv_fraction": target["uv_fraction"],
+                "illuminant": (illu or {}).get("name"),
+            }
+            region["matrix"] = region_payload
+            matrices_for_session.append(region_payload)
 
             try:
-                transformed = apply_matrix_array(img, matrix)
+                transformed = apply_false_color_array(
+                    img, target["rgb"], strength=1.0
+                )
             except NotImplementedError:
                 st.error("PHASE 3 (numpy 변환) 의존성이 미설치 상태입니다.")
                 return
@@ -1920,9 +2061,9 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
 
     result_bytes = to_png_bytes(out)
     st.session_state[SS_RESULT_BYTES] = result_bytes
-    # 대표 행렬은 첫 영역 (디버그/표시용) — 합성 결과 재현은 어차피 마스크 없이 불가
+    # 대표 페이로드는 첫 영역 (디버그/표시용) — 합성 결과 재현은 어차피 마스크 없이 불가
     st.session_state[SS_MATRIX] = (
-        matrices_for_session[0] if matrices_for_session else IDENTITY
+        matrices_for_session[0] if matrices_for_session else {}
     )
 
     try:
@@ -1934,7 +2075,8 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
 
     if fallback_count:
         st.warning(
-            f"⚠️ {fallback_count}개 영역이 스키마 위반으로 IDENTITY fallback 처리됨."
+            f"⚠️ {fallback_count}개 영역이 분광 데이터(spectral_values) 부재로 "
+            f"변환되지 않고 원본 유지됨."
         )
     st.success(f"✅ 변환 완료 · {len(regions)}개 영역 합성")
     st.rerun()
