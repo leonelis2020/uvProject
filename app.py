@@ -1836,6 +1836,55 @@ def _render_mask_canvas_for_region(region_index: int, region: dict) -> None:
     region["mask"] = mask_native.astype(bool)
 
 
+def _grabcut_foreground(
+    img_pil,
+    px1: int,
+    py1: int,
+    px2: int,
+    py2: int,
+    iters: int = 5,
+) -> "np.ndarray | None":
+    """사각형(px1,py1,px2,py2) 안에서 GrabCut 으로 전경(피사체)만 추출.
+
+    배경 제외의 핵심: 사용자가 사각형으로 새를 대충 감싸면, 그 안에서 OpenCV
+    GrabCut 이 색/질감 통계로 전경(새)과 배경(물/얼음)을 자동 분리한다.
+    반환: H×W bool 마스크 (전경 True) 또는 실패 시 None.
+    """
+    if cv2 is None or np is None:
+        return None
+    try:
+        arr = np.asarray(img_pil.convert("RGB"))
+        ih, iw = arr.shape[:2]
+        # 사각형이 너무 작으면 의미 없음
+        if (px2 - px1) < 8 or (py2 - py1) < 8:
+            return None
+        gc_mask = np.zeros((ih, iw), np.uint8)
+        bgd = np.zeros((1, 65), np.float64)
+        fgd = np.zeros((1, 65), np.float64)
+        rect = (px1, py1, px2 - px1, py2 - py1)
+        # 속도: 큰 이미지는 다운스케일해서 GrabCut 후 업스케일
+        scale = 1.0
+        work = arr
+        max_side = max(ih, iw)
+        if max_side > 600:
+            scale = 600.0 / max_side
+            work = cv2.resize(arr, (int(iw * scale), int(ih * scale)),
+                              interpolation=cv2.INTER_AREA)
+            gc_mask = np.zeros(work.shape[:2], np.uint8)
+            rect = (int(px1 * scale), int(py1 * scale),
+                    int((px2 - px1) * scale), int((py2 - py1) * scale))
+        cv2.grabCut(work, gc_mask, rect, bgd, fgd, iters, cv2.GC_INIT_WITH_RECT)
+        # GC_FGD(1) / GC_PR_FGD(3) 를 전경으로
+        fg = np.where((gc_mask == 1) | (gc_mask == 3), 1, 0).astype(np.uint8)
+        if scale != 1.0:
+            fg = cv2.resize(fg, (iw, ih), interpolation=cv2.INTER_NEAREST)
+        if fg.sum() == 0:
+            return None
+        return fg.astype(bool)
+    except Exception:
+        return None
+
+
 def _render_bbox_mask_fallback(
     region_index: int,
     region: dict,
@@ -1843,24 +1892,17 @@ def _render_bbox_mask_fallback(
     *,
     canvas_error: Exception | None = None,
 ) -> None:
-    """캔버스 마우스 트래킹이 동작하지 않을 때의 사각 영역 마스크 UI.
+    """사각 영역 마스크 UI + GrabCut 전경 자동 추출.
 
-    4개 슬라이더 (left / right / top / bottom %) 로 사각 영역을 지정하고,
-    해당 boolean 마스크를 `region['mask']` 에 저장한다. 시각 피드백을 위해
-    오렌지 오버레이 + 테두리가 그려진 미리보기를 함께 노출한다.
-
-    freedraw 가 아니라 사각형뿐인 점은 명확한 제약이며, 사용자가 보기에
-    "왜 안 칠해지나" 가 아니라 "이 영역에 매핑한다" 로 흐름이 보존된다.
+    1) 4개 슬라이더로 새를 대충 감싸는 사각형 지정
+    2) '윤곽 자동 추출(배경 제외)' 버튼 → GrabCut 으로 새만 분리
+    region['mask'] 에 boolean 마스크를 저장한다.
     """
     if Image is None or np is None:
         st.warning("Pillow / numpy 가 필요합니다 (requirements 설치).")
         return
 
     iw, ih = img_pil.size  # PIL: (W, H)
-
-    # ※ "캔버스 비호환이라 슬라이더로 대체" 안내 배너는 매 rerun 마다 노출되어
-    # 영역 expander 안에서 시각적 노이즈가 되므로 제거. 슬라이더 4개 자체가
-    # 충분히 자명한 UI 이며, 필요 시 설정 모달 진단 패널에서 추가 안내를 본다.
 
     bcols = st.columns(2)
     with bcols[0]:
@@ -1886,48 +1928,63 @@ def _render_bbox_mask_fallback(
     px1, px2 = int(iw * x1 / 100), int(iw * x2 / 100)
     py1, py2 = int(ih * y1 / 100), int(ih * y2 / 100)
 
-    mask = np.zeros((ih, iw), dtype=bool)
-    mask[py1:py2, px1:px2] = True
+    # ── GrabCut: 사각형 안에서 전경(새)만 자동 분리 → 배경 제외 ──
+    gc_key = f"grabcut_mask_{region_index}"
+    btn_cols = st.columns(2)
+    if btn_cols[0].button(
+        "✂️ 윤곽 자동 추출 (배경 제외)",
+        key=f"grabcut_btn_{region_index}",
+        help="사각형 안에서 피사체만 자동으로 따냅니다 (배경/물/얼음 제외).",
+        disabled=(cv2 is None),
+    ):
+        with st.spinner("피사체 윤곽 추출 중…"):
+            fg = _grabcut_foreground(img_pil, px1, py1, px2, py2)
+        if fg is not None:
+            st.session_state[gc_key] = fg
+            st.toast("윤곽 추출 완료 — 배경이 제외됩니다.")
+        else:
+            st.session_state.pop(gc_key, None)
+            st.warning("윤곽 추출 실패 — 사각형을 더 크게/명확하게 잡아보세요.")
+    if btn_cols[1].button(
+        "↩️ 사각형으로 되돌리기",
+        key=f"grabcut_reset_{region_index}",
+        help="자동 추출을 취소하고 사각형 전체를 마스크로 사용합니다.",
+    ):
+        st.session_state.pop(gc_key, None)
+
+    gc_mask = st.session_state.get(gc_key)
+
+    # 최종 마스크 결정: GrabCut 결과가 있으면 그걸, 없으면 사각형 전체
+    if gc_mask is not None and gc_mask.shape == (ih, iw):
+        mask = gc_mask
+        mask_kind = "윤곽(배경 제외)"
+    else:
+        mask = np.zeros((ih, iw), dtype=bool)
+        mask[py1:py2, px1:px2] = True
+        mask_kind = "사각형"
     region["mask"] = mask
 
-    # 시각 피드백 — 반투명 오버레이 + 테두리
-    arr = np.asarray(img_pil.convert("RGB")).copy()
+    # 시각 피드백 — 마스크 영역에 반투명 오렌지 오버레이
+    arr = np.asarray(img_pil.convert("RGB")).copy().astype(np.float32)
     overlay_color = np.array([255, 165, 0], dtype=np.float32)
-    region_slice = arr[py1:py2, px1:px2].astype(np.float32)
-    blended = np.clip(region_slice * 0.55 + overlay_color * 0.45, 0, 255).astype(np.uint8)
-    arr[py1:py2, px1:px2] = blended
-    border_w = max(2, int(min(iw, ih) * 0.004))
-    arr[py1:py1 + border_w, px1:px2] = overlay_color
-    arr[py2 - border_w:py2, px1:px2] = overlay_color
-    arr[py1:py2, px1:px1 + border_w] = overlay_color
-    arr[py1:py2, px2 - border_w:px2] = overlay_color
-
-    st.image(Image.fromarray(arr), **_FW)
+    sel = mask
+    arr[sel] = np.clip(arr[sel] * 0.55 + overlay_color * 0.45, 0, 255)
+    st.image(Image.fromarray(arr.astype(np.uint8)), **_FW)
     st.caption(
-        f"마스크 영역: {(x2 - x1)}% × {(y2 - y1)}%  "
-        f"({px2 - px1} × {py2 - py1} px = {int(mask.sum())} 픽셀)"
+        f"마스크: {mask_kind} · {int(mask.sum())} 픽셀 "
+        f"({int(mask.sum()) * 100 // (iw * ih)}% 영역)"
     )
 
-    # ── 캔버스가 왜 폴백됐는지 진단 (영역 expander 안에서 호출되므로 expander
-    #    중첩 금지 — st.expander 대신 일반 container 로 표시한다) ──
+    # 진단 (canvas_error 있을 때만, expander 중첩 금지 → container)
     if canvas_error is not None:
         with st.container(border=True):
             st.caption("🔧 캔버스 진단 (왜 슬라이더로 폴백?)")
             st.code(f"streamlit: {st.__version__}", language="text")
-            try:
-                import streamlit_drawable_canvas as _sdc  # type: ignore
-                sdc_ver = getattr(_sdc, "__version__", "(unknown)")
-                st.code(f"streamlit-drawable-canvas: {sdc_ver}", language="text")
-            except Exception as e:
-                st.code(
-                    f"streamlit-drawable-canvas: import 실패 — "
-                    f"{type(e).__name__}: {e}",
-                    language="text",
-                )
             st.code(
                 f"canvas 호출 예외: {type(canvas_error).__name__}: {canvas_error}",
                 language="text",
             )
+    return
 
 
 def _render_illuminant_tag_grid() -> None:
@@ -1996,6 +2053,35 @@ def render_5x10_grid() -> None:
 
 
 # ---------- 중앙↔우측 사이의 세로 버튼 컬럼 -------------------------------------
+def _reset_workspace(keep_login: bool = True) -> None:
+    """작업 상태(이미지/영역/광원/결과)를 비운다. 로그인 세션은 유지.
+
+    이미지나 태그를 바꾸려 할 때 새로고침+재로그인 없이 깨끗이 초기화한다.
+    """
+    clear_keys = [
+        SS_ORIGIN_IMAGE, SS_ORIGIN_BYTES, SS_RESULT_BYTES, SS_MATRIX,
+        SS_BASE_COLORS, SS_TILE_GRID, SS_SELECTED_ILLU, SS_REGIONS,
+        "_last_upload_name",
+    ]
+    for k in clear_keys:
+        st.session_state.pop(k, None)
+
+    # 위젯 상태(업로더/캔버스/슬라이더/검색 등)도 정리 — 잔여 키가 남으면
+    # 새 이미지에 옛 마스크/슬라이더가 따라붙는다. 접두사로 일괄 제거.
+    prefixes = (
+        "uploader", "canvas_region_", "use_canvas_", "stroke_",
+        "bbox_x1_", "bbox_x2_", "bbox_y1_", "bbox_y2_",
+        "irid_mode_radio_", "irid_boost_", "subject_search",
+        "illu_", "add_region_", "del_region_",
+    )
+    for k in list(st.session_state.keys()):
+        if any(str(k).startswith(p) for p in prefixes):
+            st.session_state.pop(k, None)
+
+    if not keep_login:
+        st.session_state.pop(SS_AUTH_USER, None)
+
+
 def render_action_buttons() -> None:
     """Upload → Convert → Finish 세로 버튼.
 
@@ -2044,6 +2130,19 @@ def render_action_buttons() -> None:
         help=convert_help,
     ):
         _run_convert_multi(regions, illu)
+
+    st.write("")
+
+    # ----- 비우기 (이미지/태그/결과 초기화 · 로그인 유지) -----
+    if st.button(
+        "🗑️ 비우기",
+        **_FW,
+        help="이미지·영역·광원·결과를 모두 지웁니다. 로그인은 유지됩니다.",
+        disabled=not (has_image or has_region or has_illu),
+    ):
+        _reset_workspace(keep_login=True)
+        st.toast("작업 공간을 비웠습니다.")
+        st.rerun()
 
     st.write("")
 
