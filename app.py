@@ -1402,28 +1402,44 @@ def fetch_my_shared_projects(owner_id: str | None, limit: int = 20) -> list[dict
 
 
 def fetch_others_shared_projects(owner_id: str | None, limit: int = 20) -> list[dict]:
-    """좌측 사이드바 — '남이 공유한' 라인업 (anon_gallery_view 우선, 실패 시 projects fallback)."""
+    """좌측 사이드바 — '남이 공유한' 라인업.
+
+    [버그픽스] 과거엔 is_anonymous=True 인 것만 보여줘서, 닉네임 공개로 공유한
+    프로젝트가 갤러리에 안 떴다("팔레트 공개했는데 안 보임"). 이제 익명 여부와
+    무관하게 '남이 공유한 모든 Active 프로젝트'를 보여준다. (익명 여부는 제작자
+    표시에만 영향.) 닉네임을 함께 가져오기 위해 projects_with_nickname 뷰 우선.
+    """
+    # 1순위: 닉네임 조인 뷰
     try:
-        q = conn.table("anon_gallery_view").select("*").limit(limit)
+        q = (
+            conn.table("projects_with_nickname")
+            .select("*")
+            .eq("status", "Active")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
+        if owner_id:
+            q = q.neq("owner_id", owner_id)
+        resp = q.execute()
+        if resp.data is not None:
+            return resp.data or []
+    except Exception:
+        pass
+    # 2순위: 뷰 없으면 projects 직접
+    try:
+        q = (
+            conn.table("projects")
+            .select(_PROJECT_SELECT)
+            .eq("status", "Active")
+            .order("created_at", desc=True)
+            .limit(limit)
+        )
         if owner_id:
             q = q.neq("owner_id", owner_id)
         resp = q.execute()
         return resp.data or []
     except Exception:
-        try:
-            q = (
-                conn.table("projects")
-                .select(_PROJECT_SELECT)
-                .eq("is_anonymous", True)
-                .order("created_at", desc=True)
-                .limit(limit)
-            )
-            if owner_id:
-                q = q.neq("owner_id", owner_id)
-            resp = q.execute()
-            return resp.data or []
-        except Exception:
-            return []
+        return []
 
 
 def fetch_palette_for_project(project_id: str) -> list[str]:
