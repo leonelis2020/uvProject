@@ -327,11 +327,21 @@ WAVELENGTHS = list(range(300, 701, 10))
 
 
 def spectrum_to_array(spec: dict | None, fill: float = 0.0) -> "np.ndarray":
-    """{"300": 0.08, ...} (str/int 키 혼용 허용) → 41-길이 float 배열. 누락은 fill."""
+    """{"300": 0.08, ...} (str/int 키 혼용 허용) → 41-길이 float 배열. 누락은 fill.
+
+    Supabase jsonb 컬럼이 dict 가 아니라 JSON '문자열' 로 반환되는 환경이 있어
+    (이게 'D65/블랙라이트 골라도 안 변함' 의 원인이었다) 문자열이면 먼저 파싱한다.
+    """
     if np is None:
         raise NotImplementedError("numpy 미설치")
+    # jsonb 가 문자열로 온 경우 파싱
+    if isinstance(spec, str):
+        try:
+            spec = json.loads(spec)
+        except Exception:
+            spec = None
     out = np.full(len(WAVELENGTHS), fill, dtype=np.float64)
-    if not spec:
+    if not spec or not isinstance(spec, dict):
         return out
     for i, wl in enumerate(WAVELENGTHS):
         v = spec.get(str(wl), spec.get(wl))
@@ -1833,30 +1843,26 @@ def _render_bbox_mask_fallback(
         f"({px2 - px1} × {py2 - py1} px = {int(mask.sum())} 픽셀)"
     )
 
-    # ── 캔버스가 왜 폴백됐는지 진단 (접힌 채로 — 노이즈 X, 필요 시 펼침) ──
-    with st.expander("🔧 캔버스 진단 (왜 슬라이더로 폴백?)", expanded=False):
-        st.code(f"streamlit:                 {st.__version__}", language="text")
-        try:
-            import streamlit_drawable_canvas as _sdc  # type: ignore
-            sdc_ver = getattr(_sdc, "__version__", "(unknown)")
-            st.code(f"streamlit-drawable-canvas: {sdc_ver}", language="text")
-        except Exception as e:
+    # ── 캔버스가 왜 폴백됐는지 진단 (영역 expander 안에서 호출되므로 expander
+    #    중첩 금지 — st.expander 대신 일반 container 로 표시한다) ──
+    if canvas_error is not None:
+        with st.container(border=True):
+            st.caption("🔧 캔버스 진단 (왜 슬라이더로 폴백?)")
+            st.code(f"streamlit: {st.__version__}", language="text")
+            try:
+                import streamlit_drawable_canvas as _sdc  # type: ignore
+                sdc_ver = getattr(_sdc, "__version__", "(unknown)")
+                st.code(f"streamlit-drawable-canvas: {sdc_ver}", language="text")
+            except Exception as e:
+                st.code(
+                    f"streamlit-drawable-canvas: import 실패 — "
+                    f"{type(e).__name__}: {e}",
+                    language="text",
+                )
             st.code(
-                f"streamlit-drawable-canvas: import 실패 — "
-                f"{type(e).__name__}: {e}",
+                f"canvas 호출 예외: {type(canvas_error).__name__}: {canvas_error}",
                 language="text",
             )
-        if canvas_error is not None:
-            st.code(
-                f"canvas 호출 예외:           "
-                f"{type(canvas_error).__name__}: {canvas_error}",
-                language="text",
-            )
-        st.caption(
-            "freedraw 가 되려면 `streamlit==1.41.1` 이 설치돼 있어야 합니다. "
-            "위 버전이 1.41.x 가 아니면 `pip install --upgrade --force-reinstall "
-            "-r requirements.txt` 를 실행하세요."
-        )
 
 
 def _render_illuminant_tag_grid() -> None:
@@ -2045,6 +2051,16 @@ def _run_convert_multi(regions: list[dict], illu: dict) -> None:
 
     # 광원 SPD 는 이미지 전체 1개 공통 (사진 한 장 = 한 조명).
     spd = (illu or {}).get("spd_data")
+
+    # ── 진단: SPD/reflectance 가 비어있으면 변환이 무력화되므로 미리 경고 ──
+    spd_probe = spectrum_to_array(spd)
+    if float(spd_probe.sum()) == 0.0:
+        st.error(
+            f"⚠️ 광원 '{(illu or {}).get('name')}' 의 SPD(spd_data) 가 비어있거나 "
+            "파싱되지 않았습니다 → 변환이 적용되지 않습니다. "
+            "standard_illuminants 테이블의 spd_data 값을 확인하세요."
+        )
+        return
 
     with st.spinner(f"UV false-color 변환 × {len(regions)} 영역…"):
         for region in regions:
